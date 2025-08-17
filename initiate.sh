@@ -92,16 +92,6 @@ if [[ "$(uname -m)" == "aarch64" ]]; then
   log_success "ARM postfix fix applied"
 fi
 
-# === SSH Hardening ===
-log_step "Securing SSH (port 2022, disable password login)"
-sed -i 's/^#\?Port .*/Port 2022/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-systemctl restart sshd
-# Adjust UFW rules
-ufw delete allow 22 || true
-ufw allow 2022/tcp
-log_success "SSH secured: now on port 2022, password login disabled"
-
 # === Docker ===
 log_step "Installing Docker"
 install -m 0755 -d /etc/apt/keyrings
