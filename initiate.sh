@@ -89,7 +89,7 @@ chmod +x virtualmin-install.sh
 log_success "Virtualmin installed"
 
 # Step 5.1: Fix Virtualmin repo "arch=all"
-sed -i 's|deb \[signed-by=/usr/share/keyrings/debian-virtualmin-7.gpg\]|deb [arch=all signed-by=/usr/share/keyrings/debian-virtualmin-7.gpg]|' /etc/apt/sources.list.d/virtualmin.list
+sed -i 's|deb \[signed-by|deb [arch=all signed-by|' /etc/apt/sources.list.d/virtualmin.list
 log_success "Fixed Virtualmin repo arch setting"
 
 # Step 5.2: ARM postfix fix
