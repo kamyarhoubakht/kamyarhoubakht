@@ -121,12 +121,13 @@ log_success "User '$sudo_user' added to docker group"
 
 # Step 7: Install Portainer
 log_step "Installing Portainer"
-docker volume create portainer_data || log_error "Failed to create Portainer data volume."
-log_success "Created Portainer data volume."
+(
+  docker volume create portainer_data || { log_error "Failed to create Portainer data volume."; exit 1; }
+  log_success "Created Portainer data volume."
 
-su - "$sudo_user" -c "mkdir -p ~/portainer"
+  su - "$sudo_user" -c "mkdir -p ~/portainer" || { log_error "Failed to create Portainer directory."; exit 1; }
 
-cat > "/home/$sudo_user/portainer/docker-compose.yaml" << 'EOF'
+  cat > "/home/$sudo_user/portainer/docker-compose.yaml" << 'EOF'
 name: Portainer
 services:
   portainer-ce:
@@ -145,9 +146,13 @@ volumes:
     name: portainer_data
 EOF
 
-chown "$sudo_user:$sudo_user" "/home/$sudo_user/portainer/docker-compose.yaml"
-su - "$sudo_user" -c "cd ~/portainer && docker compose up -d"
-log_success "Portainer started successfully."
+  chown "$sudo_user:$sudo_user" "/home/$sudo_user/portainer/docker-compose.yaml" || { log_error "Failed to set ownership of Portainer docker-compose file."; exit 1; }
+  if ! su - "$sudo_user" -c "cd ~/portainer && docker compose up -d"; then
+    log_error "Failed to start Portainer. Continuing to next step."
+  else
+    log_success "Portainer started successfully."
+  fi
+) || true
 
 # Step 8: Prompt + Install NextCloud-AIO
 read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
