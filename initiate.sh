@@ -177,7 +177,7 @@ services:
       - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
-      - 127.0.0.1:8080:8080
+      - 8080:8080
     environment:
       - APACHE_PORT=11222
       - APACHE_IP_BINDING=127.0.0.1
@@ -211,5 +211,5 @@ echo ""
 echo "Access URLs:" | tee -a "$LOG_FILE"
 echo "Virtualmin: https://$hostname:10000" | tee -a "$LOG_FILE"
 echo "Portainer: https://127.0.0.1:9443" | tee -a "$LOG_FILE"
-[[ "$install_nc" =~ ^[Yy]$ ]] && echo "NextCloud AIO: http://127.0.0.1:8080" | tee -a "$LOG_FILE"
+[[ "$install_nc" =~ ^[Yy]$ ]] && echo "NextCloud AIO: https://$hostname:8080" | tee -a "$LOG_FILE"
 echo "Installation completed successfully!" | tee -a "$LOG_FILE"
