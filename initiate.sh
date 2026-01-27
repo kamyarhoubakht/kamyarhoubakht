@@ -31,7 +31,10 @@ validate_password() {
   return 0
 }
 
-if [[ "$EUID" -ne 0 ]]; then log_error "This script must be run as root."; exit 1; fi
+if [[ "$EUID" -ne 0 ]]; then
+  log_error "This script must be run as root."
+  exit 1
+fi
 
 # Backups
 log_step "Creating backup of important configuration files"
@@ -42,13 +45,14 @@ for file in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/sudoers.d; do
 done
 log_success "Backup created at $BACKUP_DIR"
 
-# Step 1: Prompt for sudo username
+# Step 1: Prompt for sudo username (reuse if exists, create if not)
 read -rp "Enter a sudo username (default: goodmin): " sudo_user
 sudo_user=${sudo_user:-goodmin}
-log_step "Creating new sudo user '$sudo_user'"
+
 if id -u "$sudo_user" &>/dev/null; then
-  log_success "User '$sudo_user' already exists."
+  log_success "User '$sudo_user' already exists. Using existing user."
 else
+  log_step "Creating new sudo user '$sudo_user'"
   useradd -m -s /bin/bash "$sudo_user" || log_error "Failed to create user '$sudo_user'."
   echo "$sudo_user ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$sudo_user"
   chmod 0440 "/etc/sudoers.d/$sudo_user"
@@ -57,7 +61,11 @@ else
     read -s -p "Enter password for '$sudo_user': " password; echo
     if ! validate_password "$password"; then continue; fi
     read -s -p "Confirm password: " password_confirm; echo
-    [[ "$password" == "$password_confirm" ]] && { echo "$sudo_user:$password" | chpasswd; log_success "Password set."; break; } || echo "Mismatch. Try again."
+    [[ "$password" == "$password_confirm" ]] && {
+      echo "$sudo_user:$password" | chpasswd
+      log_success "Password set."
+      break
+    } || echo "Mismatch. Try again."
   done
 fi
 
@@ -146,7 +154,8 @@ volumes:
     name: portainer_data
 EOF
 
-  chown "$sudo_user:$sudo_user" "/home/$sudo_user/portainer/docker-compose.yaml" || { log_error "Failed to set ownership of Portainer docker-compose file."; exit 1; }
+  chown "$sudo_user:$sudo_user" "/home/$sudo_user/portainer/docker-compose.yaml"
+
   if ! su - "$sudo_user" -c "cd ~/portainer && docker compose up -d"; then
     log_error "Failed to start Portainer. Continuing to next step."
   else
@@ -192,7 +201,6 @@ volumes:
 EOF
 
   chown "$sudo_user:$sudo_user" "/home/$sudo_user/nextcloud-aio/docker-compose.yaml"
-
   su - "$sudo_user" -c "cd ~/nextcloud-aio && docker compose up -d"
   log_success "NextCloud AIO started successfully."
 fi
@@ -208,8 +216,4 @@ echo "Portainer   | Docker management UI" | tee -a "$LOG_FILE"
 [[ "$install_nc" =~ ^[Yy]$ ]] && echo "NextCloud   | File sync & collaboration" | tee -a "$LOG_FILE"
 echo "-----------------------------" | tee -a "$LOG_FILE"
 echo ""
-echo "Access URLs:" | tee -a "$LOG_FILE"
-echo "Virtualmin: https://$hostname:10000" | tee -a "$LOG_FILE"
-echo "Portainer: https://127.0.0.1:9443" | tee -a "$LOG_FILE"
-[[ "$install_nc" =~ ^[Yy]$ ]] && echo "NextCloud AIO: https://$hostname:8080" | tee -a "$LOG_FILE"
-echo "Installation completed successfully!" | tee -a "$LOG_FILE"
+echo "Access
