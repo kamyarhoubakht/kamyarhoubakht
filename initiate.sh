@@ -96,9 +96,14 @@ chmod +x virtualmin-install.sh
 ./virtualmin-install.sh --force --bundle "$stack_choice" --hostname "$hostname"
 log_success "Virtualmin installed"
 
-# Step 5.1: Fix Virtualmin repo "arch=all"
-sed -i 's|deb \[signed-by|deb [arch=all signed-by|' /etc/apt/sources.list.d/virtualmin.list
-log_success "Fixed Virtualmin repo arch setting"
+# Step 5.1: Fix Virtualmin repo "arch=all" (ARM only)
+if [[ "$(uname -m)" == "aarch64" ]]; then
+  log_step "Fixing Virtualmin repo arch setting (ARM)"
+  sed -i 's|deb \[signed-by|deb [arch=all signed-by|' /etc/apt/sources.list.d/virtualmin.list
+  log_success "Fixed Virtualmin repo arch setting for ARM"
+else
+  log_step "Skipping Virtualmin repo arch fix (not ARM)"
+fi
 
 # Step 5.2: ARM postfix fix
 if [[ "$(uname -m)" == "aarch64" ]]; then
