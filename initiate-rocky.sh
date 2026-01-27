@@ -39,6 +39,16 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 # --------------------------------------------------
+# Force DNS (fix fresh Rocky Linux resolver issues)
+# --------------------------------------------------
+log_step "Configuring DNS resolvers"
+cat > /etc/resolv.conf <<EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+log_success "DNS resolvers configured"
+
+# --------------------------------------------------
 # SELinux: set permissive (best balance for Docker)
 # --------------------------------------------------
 log_step "Setting SELinux to permissive mode"
@@ -93,7 +103,7 @@ fi
 log_step "Updating system"
 dnf -y update
 dnf -y install epel-release
-dnf -y install curl wget tmux btop ca-certificates gnupg2 gcc policycoreutils-python-utils
+dnf -y install curl wget nano tmux btop ca-certificates gnupg2 gcc policycoreutils-python-utils
 log_success "System updated"
 
 # --------------------------------------------------
