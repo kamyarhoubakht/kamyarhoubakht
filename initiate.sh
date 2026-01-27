@@ -91,7 +91,7 @@ log_success "Hostname set to $hostname"
 # Step 5: Virtualmin install
 log_step "Installing Virtualmin ($stack_choice)"
 export VIRTUALMIN_NONINTERACTIVE=1
-curl -fsSL https://software.virtualmin.com/gpl/scripts/virtualmin-install.sh -o virtualmin-install.sh
+curl -fsSL https://download.virtualmin.com/virtualmin-install.sh -o virtualmin-install.sh
 chmod +x virtualmin-install.sh
 ./virtualmin-install.sh --force --bundle "$stack_choice" --hostname "$hostname"
 log_success "Virtualmin installed"
