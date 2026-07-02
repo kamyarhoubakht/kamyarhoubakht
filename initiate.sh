@@ -14,7 +14,7 @@ handle_error() {
   exit $exit_code
 }
 cleanup() {
-  rm -f virtualmin-install.sh
+  :
 }
 trap 'handle_error $LINENO' ERR
 trap cleanup EXIT
@@ -114,9 +114,7 @@ log_success "Hostname set to $hostname"
 if ! step_done "virtualmin"; then
   log_step "Installing Virtualmin ($stack_choice)"
   export VIRTUALMIN_NONINTERACTIVE=1
-  curl -fsSL https://download.virtualmin.com/virtualmin-install.sh -o virtualmin-install.sh
-  chmod +x virtualmin-install.sh
-  ./virtualmin-install.sh --force --bundle "$stack_choice" --hostname "$hostname"
+  sh -c "$(curl -fsSL https://download.virtualmin.com/virtualmin-install)" -- --force --bundle "$stack_choice" --hostname "$hostname"
   log_success "Virtualmin installed"
   mark_done "virtualmin"
 else
@@ -179,14 +177,14 @@ if ! step_done "portainer"; then
 name: Portainer
 services:
   portainer-ce:
-    image: portainer/portainer-ce:lts
+    image: portainer/portainer-ce:2.40.0
     container_name: portainer
     restart: always
     ports:
       - 127.0.0.1:8000:8000
       - 127.0.0.1:9443:9443
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - portainer_data:/data
 volumes:
   portainer_data:
@@ -222,7 +220,7 @@ if [[ "$install_nc" =~ ^[Yy]$ ]] && ! step_done "nextcloud"; then
   cat > "/home/$sudo_user/nextcloud-aio/docker-compose.yaml" << 'EOF'
 services:
   nextcloud-aio-mastercontainer:
-    image: nextcloud/all-in-one:latest
+    image: ghcr.io/nextcloud-releases/all-in-one:latest
     init: true
     restart: always
     container_name: nextcloud-aio-mastercontainer
