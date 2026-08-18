@@ -581,62 +581,25 @@ else
     echo "$install_nc" > /root/.nextcloud_choice
 fi
 
-if [[ "$install_nc" =~ ^y$ ]] && ! step_done "nextcloud"; then
+if [[ "$install_nc" =~ ^y$ ]]; then
 
-    log_step "Installing NextCloud-AIO"
+    if [[ ! -x /root/install-nextcloud-aio.sh ]]; then
+        log_step "Downloading Nextcloud AIO installation script"
 
-    mkdir -p /mnt/ncdata
+        curl -fsSL \
+            "https://raw.githubusercontent.com/kamyarhoubakht/kamyarhoubakht/refs/heads/main/install-nextcloud-aio.sh" \
+            -o /root/install-nextcloud-aio.sh
 
-    chown "$sudo_user:$(id -gn "$sudo_user")" /mnt/ncdata
-    chmod 750 /mnt/ncdata
+        chmod 700 /root/install-nextcloud-aio.sh
 
-    NEXTCLOUD_DIR="/home/$sudo_user/nextcloud-aio"
+        log_success "Nextcloud AIO installer downloaded."
+    fi
 
-    mkdir -p "$NEXTCLOUD_DIR"
+    log_step "Starting Nextcloud AIO installation"
 
-    cat > "$NEXTCLOUD_DIR/docker-compose.yaml" <<'EOF'
-services:
-  nextcloud-aio-mastercontainer:
-    image: ghcr.io/nextcloud-releases/all-in-one:latest
-    init: true
-    restart: always
-    container_name: nextcloud-aio-mastercontainer
+    /root/install-nextcloud-aio.sh
 
-    volumes:
-      - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    ports:
-      - "8080:8080"
-
-    environment:
-      - APACHE_PORT=11222
-      - APACHE_IP_BINDING=127.0.0.1
-      - SKIP_DOMAIN_VALIDATION=true
-      - NEXTCLOUD_DATADIR=/mnt/ncdata
-      - NEXTCLOUD_MOUNT=/mnt/
-      - NEXTCLOUD_STARTUP_APPS=twofactor_totp calendar contacts files_external
-      - NEXTCLOUD_ENABLE_DRI_DEVICE=false
-
-volumes:
-  nextcloud_aio_mastercontainer:
-    name: nextcloud_aio_mastercontainer
-EOF
-
-    chown -R "$sudo_user:$(id -gn "$sudo_user")" "$NEXTCLOUD_DIR"
-
-    (
-        cd "$NEXTCLOUD_DIR"
-        docker compose up -d
-    )
-
-    log_success "NextCloud-AIO started successfully."
-
-    mark_done "nextcloud"
-
-elif [[ "$install_nc" =~ ^y$ ]]; then
-
-    log_success "NextCloud-AIO already installed, skipping."
+    log_success "Nextcloud AIO installation script completed."
 
 else
 
