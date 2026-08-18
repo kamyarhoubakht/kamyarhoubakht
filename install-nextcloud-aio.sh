@@ -67,19 +67,17 @@ fi
 # Required commands
 # ---------------------------------------------------------------------------
 
-for command in docker docker-compose virtualmin apache2ctl curl; do
+for command in docker virtualmin apache2ctl curl openssl; do
     if ! command -v "$command" >/dev/null 2>&1; then
-
-        # docker compose is a plugin, so docker-compose itself may not exist.
-        if [[ "$command" == "docker-compose" ]] &&
-           docker compose version >/dev/null 2>&1; then
-            continue
-        fi
-
         log_error "Required command not found: $command"
         exit 1
     fi
 done
+
+if ! docker compose version >/dev/null 2>&1; then
+    log_error "Docker Compose plugin is not available."
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Check Virtualmin
@@ -87,15 +85,6 @@ done
 
 if ! command -v virtualmin >/dev/null 2>&1; then
     log_error "Virtualmin command not found."
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Check Apache
-# ---------------------------------------------------------------------------
-
-if ! command -v apache2ctl >/dev/null 2>&1; then
-    log_error "Apache is not installed."
     exit 1
 fi
 
@@ -111,10 +100,10 @@ fi
 # ---------------------------------------------------------------------------
 # Ask for AIO domain
 #
-# This is deliberately a TOP-LEVEL Virtualmin domain.
+# This is an independent TOP-LEVEL Virtualmin domain.
 #
-# It does NOT need to belong to another Virtualmin parent domain.
-# DNS can remain completely external.
+# It does not require a parent domain to exist on this server.
+# DNS can be managed elsewhere.
 # ---------------------------------------------------------------------------
 
 if [[ -f /root/.nextcloud_aio_domain ]]; then
@@ -141,13 +130,13 @@ if [[ ! -f /root/.nextcloud_aio_domain ]]; then
     echo " Nextcloud AIO domain"
     echo "============================================================"
     echo
-    echo "Enter the complete domain that will point to this server."
+    echo "Enter the complete domain that will be used for Nextcloud."
     echo
     echo "Example:"
     echo "  cloud.example.com"
     echo
-    echo "DNS for this domain must point to this server's public IP."
-    echo "It does NOT need to exist as a parent domain in Virtualmin."
+    echo "DNS for this domain must eventually point to this server."
+    echo "The parent domain does NOT need to exist in Virtualmin."
     echo
 
     while true; do
@@ -163,11 +152,8 @@ if [[ ! -f /root/.nextcloud_aio_domain ]]; then
 
         if ! [[ "$aio_domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
             echo
-            echo "Invalid domain:"
-            echo "  $aio_domain"
-            echo
-            echo "Please enter a complete domain such as:"
-            echo "  cloud.example.com"
+            echo "Invalid domain: $aio_domain"
+            echo "Example: cloud.example.com"
             echo
             continue
         fi
@@ -184,7 +170,15 @@ fi
 log_success "Nextcloud AIO domain: $aio_domain"
 
 # ---------------------------------------------------------------------------
-# Check whether Virtualmin domain already exists
+# Create independent Virtualmin top-level domain
+#
+# This domain is used only as the future Apache reverse-proxy endpoint.
+#
+# No mail.
+# No DNS.
+# No databases.
+# No FTP.
+# No additional subdomains.
 # ---------------------------------------------------------------------------
 
 if virtualmin list-domains --name-only 2>/dev/null \
@@ -194,27 +188,7 @@ if virtualmin list-domains --name-only 2>/dev/null \
 
 else
 
-    # -----------------------------------------------------------------------
-    # Create independent TOP-LEVEL Virtualmin domain.
-    #
-    # Deliberately enabled:
-    #   --unix
-    #   --dir
-    #   --web
-    #   --ssl
-    #
-    # Deliberately NOT enabled:
-    #   --mail
-    #   --dns
-    #   --webmin
-    #   --mysql
-    #   --postgres
-    #   --ftp
-    #
-    # No parent domain is specified.
-    # -----------------------------------------------------------------------
-
-    log_step "Creating independent Virtualmin Apache domain"
+    log_step "Creating independent Virtualmin domain"
 
     DOMAIN_PASSWORD="$(openssl rand -base64 48)"
 
@@ -234,22 +208,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Verify that Apache web support exists
+# Required Apache modules
+#
+# They are enabled now, although the proxy itself will be configured later.
 # ---------------------------------------------------------------------------
 
-if ! virtualmin list-domains --name-only 2>/dev/null \
-    | grep -Fxq "$aio_domain"; then
-
-    log_error "Virtualmin failed to create/find $aio_domain."
-    exit 1
-
-fi
-
-# ---------------------------------------------------------------------------
-# Enable required Apache modules
-# ---------------------------------------------------------------------------
-
-log_step "Enabling Apache proxy modules"
+log_step "Enabling required Apache modules"
 
 a2enmod \
     proxy \
@@ -264,7 +228,7 @@ a2enmod \
 log_success "Apache proxy modules enabled."
 
 # ---------------------------------------------------------------------------
-# AIO data directory
+# Nextcloud data directory
 # ---------------------------------------------------------------------------
 
 if ! step_done "aio_data"; then
@@ -277,7 +241,7 @@ if ! step_done "aio_data"; then
 
     mark_done "aio_data"
 
-    log_success "Nextcloud data directory ready."
+    log_success "Nextcloud data directory created."
 
 else
 
@@ -286,16 +250,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Nextcloud AIO Docker configuration
+# Docker Compose
 # ---------------------------------------------------------------------------
 
 AIO_DIR="/root/nextcloud-aio"
+AIO_COMPOSE="$AIO_DIR/docker-compose.yaml"
 
 mkdir -p "$AIO_DIR"
 
-AIO_COMPOSE="$AIO_DIR/docker-compose.yaml"
-
-if ! step_done "aio_container"; then
+if ! step_done "aio_compose"; then
 
     log_step "Creating Nextcloud AIO Docker Compose configuration"
 
@@ -313,7 +276,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
     ports:
-      - "127.0.0.1:8080:8080"
+      # AIO initial setup interface.
+      # Intentionally publicly accessible.
+      - "8080:8080"
+
+      # Nextcloud Apache backend.
+      # Must NEVER be exposed publicly.
       - "127.0.0.1:11222:11222"
 
     environment:
@@ -331,45 +299,51 @@ volumes:
     name: nextcloud_aio_mastercontainer
 EOF
 
-    log_success "AIO Docker Compose file created."
+    mark_done "aio_compose"
 
-    mark_done "aio_container"
+    log_success "AIO Docker Compose file created."
 
 else
 
-    log_success "AIO Docker configuration already exists."
+    log_success "AIO Docker Compose file already exists."
 
 fi
 
 # ---------------------------------------------------------------------------
-# Start Nextcloud AIO
+# Start / recreate AIO mastercontainer
 # ---------------------------------------------------------------------------
 
-log_step "Starting Nextcloud AIO"
+log_step "Starting Nextcloud AIO mastercontainer"
 
 (
     cd "$AIO_DIR"
     docker compose up -d
 )
 
-log_success "Nextcloud AIO container started."
+log_success "Nextcloud AIO mastercontainer started."
 
 # ---------------------------------------------------------------------------
-# Wait for AIO Apache
+# Wait only for AIO setup interface on port 8080
+#
+# IMPORTANT:
+#
+# Port 11222 is NOT checked here.
+#
+# The AIO Apache backend only becomes available after the AIO setup process
+# has been completed through the 8080 interface.
 # ---------------------------------------------------------------------------
 
-log_step "Waiting for AIO Apache on 127.0.0.1:11222"
+log_step "Waiting for Nextcloud AIO setup interface on port 8080"
 
 aio_ready=false
 
-for i in {1..90}; do
+for i in {1..60}; do
 
     if curl \
         --silent \
         --show-error \
-        --fail \
         --max-time 3 \
-        http://127.0.0.1:11222/ \
+        http://127.0.0.1:8080/ \
         >/dev/null 2>&1; then
 
         aio_ready=true
@@ -383,10 +357,10 @@ done
 
 if [[ "$aio_ready" != true ]]; then
 
-    log_error "AIO Apache did not become available."
+    log_error "Nextcloud AIO setup interface did not become available."
 
     echo
-    echo "Docker container status:"
+    echo "Container status:"
     docker ps -a --filter "name=nextcloud-aio-mastercontainer"
 
     echo
@@ -397,268 +371,50 @@ if [[ "$aio_ready" != true ]]; then
 
 fi
 
-log_success "AIO Apache is running on 127.0.0.1:11222."
+log_success "Nextcloud AIO setup interface is available."
 
 # ---------------------------------------------------------------------------
-# Create Apache proxy configuration
-#
-# We use a Virtualmin-managed custom Apache include for this domain.
-# The configuration is kept in /etc/apache2/conf-available so it is easy
-# to inspect and manage independently from Virtualmin-generated files.
+# Detect server IP
 # ---------------------------------------------------------------------------
 
-log_step "Creating Apache reverse-proxy configuration"
-
-PROXY_CONF="/etc/apache2/conf-available/nextcloud-aio-${aio_domain}.conf"
-
-cat > "$PROXY_CONF" <<EOF
-# ---------------------------------------------------------------------------
-# Nextcloud AIO reverse proxy
-# Domain: $aio_domain
-#
-# Managed by install-nextcloud-aio.sh
-# Backend: http://127.0.0.1:11222/
-# ---------------------------------------------------------------------------
-
-<IfModule mod_proxy.c>
-
-    ProxyPreserveHost On
-
-    AllowEncodedSlashes NoDecode
-
-    RequestHeader set X-Real-IP %{REMOTE_ADDR}s
-
-    ProxyPass / http://127.0.0.1:11222/ nocanon
-    ProxyPassReverse / http://127.0.0.1:11222/
-
-    <IfModule mod_rewrite.c>
-
-        RewriteEngine On
-
-        RewriteCond %{HTTP:Upgrade} websocket [NC]
-        RewriteCond %{HTTP:Connection} upgrade [NC]
-        RewriteCond %{THE_REQUEST} "^[a-zA-Z]+ /(.*) HTTP/\\d+(\\.\\d+)?$"
-        RewriteRule .? "ws://127.0.0.1:11222/%1" [P,L,UnsafeAllow3F]
-
-    </IfModule>
-
-</IfModule>
-
-# Solves slow upload speeds caused by HTTP/2
-H2WindowSize 5242880
-
-# Disable HTTP TRACE method.
-TraceEnable off
-
-<Files ".ht*">
-    Require all denied
-</Files>
-
-# Support big file uploads
-LimitRequestBody 0
-
-Timeout 86400
-ProxyTimeout 86400
-EOF
-
-chmod 644 "$PROXY_CONF"
+SERVER_IP="$(hostname -I | awk '{print $1}')"
 
 # ---------------------------------------------------------------------------
-# Enable the configuration
-# ---------------------------------------------------------------------------
-
-a2enconf "nextcloud-aio-${aio_domain}" >/dev/null
-
-log_success "Apache reverse-proxy configuration enabled."
-
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-#
-# The proxy directives above are global Apache directives. They must only
-# apply to the AIO domain. Therefore we add the configuration directly to
-# the Virtualmin-generated VirtualHost using an include.
-#
-# Find the SSL VirtualHost generated by Virtualmin and add the include
-# inside it if it is not already present.
-# ---------------------------------------------------------------------------
-
-log_step "Attaching proxy configuration to the Virtualmin virtual host"
-
-APACHE_SITE="$(find /etc/apache2/sites-enabled \
-    -maxdepth 1 \
-    -type f \
-    \( -name "*${aio_domain}*.conf" -o -name "*.conf" \) \
-    -print 2>/dev/null \
-    | while read -r file; do
-        if grep -q "ServerName[[:space:]]\+$aio_domain" "$file" 2>/dev/null; then
-            echo "$file"
-            break
-        fi
-    done
-)"
-
-if [[ -z "$APACHE_SITE" ]]; then
-    log_error "Could not locate the Apache VirtualHost for $aio_domain."
-    exit 1
-fi
-
-log_success "Virtualmin Apache configuration found: $APACHE_SITE"
-
-# ---------------------------------------------------------------------------
-# Add the Include only once.
-# ---------------------------------------------------------------------------
-
-if ! grep -Fq "$PROXY_CONF" "$APACHE_SITE"; then
-
-    cp -a "$APACHE_SITE" "${APACHE_SITE}.nextcloud-aio-backup"
-
-    # Insert the include immediately before the closing VirtualHost.
-    sed -i \
-        "\#</VirtualHost>#i IncludeOptional $PROXY_CONF" \
-        "$APACHE_SITE"
-
-    log_success "Proxy configuration attached to $aio_domain."
-
-else
-
-    log_success "Proxy configuration already attached."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Test Apache configuration
-# ---------------------------------------------------------------------------
-
-log_step "Testing Apache configuration"
-
-if ! apache2ctl configtest; then
-
-    log_error "Apache configuration test failed."
-
-    echo
-    echo "The previous Virtualmin configuration was backed up to:"
-    echo "  ${APACHE_SITE}.nextcloud-aio-backup"
-    echo
-
-    exit 1
-
-fi
-
-log_success "Apache configuration is valid."
-
-systemctl reload apache2
-
-log_success "Apache reloaded."
-
-# ---------------------------------------------------------------------------
-# Request Let's Encrypt certificate
-#
-# DNS must already point aio_domain to this server.
-# ---------------------------------------------------------------------------
-
-log_step "Requesting Let's Encrypt certificate for $aio_domain"
-
-if virtualmin list-domains --domain "$aio_domain" --multiline 2>/dev/null \
-    | grep -qi "SSL.*yes"; then
-
-    virtualmin generate-letsencrypt-cert \
-        --domain "$aio_domain" \
-        --web \
-        --renew
-
-else
-
-    log_step "Enabling SSL and requesting Let's Encrypt certificate"
-
-    virtualmin modify-web \
-        --domain "$aio_domain" \
-        --ssl \
-        --letsencrypt-renew
-
-    virtualmin generate-letsencrypt-cert \
-        --domain "$aio_domain" \
-        --web \
-        --renew
-
-fi
-
-log_success "Let's Encrypt certificate configured."
-
-# ---------------------------------------------------------------------------
-# Final Apache test and reload
-# ---------------------------------------------------------------------------
-
-log_step "Performing final Apache configuration test"
-
-apache2ctl configtest
-
-systemctl reload apache2
-
-log_success "Apache final reload completed."
-
-# ---------------------------------------------------------------------------
-# Verify proxy locally
-# ---------------------------------------------------------------------------
-
-log_step "Checking AIO backend"
-
-if curl \
-    --silent \
-    --show-error \
-    --fail \
-    --max-time 10 \
-    http://127.0.0.1:11222/ \
-    >/dev/null 2>&1; then
-
-    log_success "AIO backend responds correctly."
-
-else
-
-    log_error "AIO backend did not respond."
-    exit 1
-
-fi
-
-# ---------------------------------------------------------------------------
-# Save state
-# ---------------------------------------------------------------------------
-
-mark_done "complete"
-
-# ---------------------------------------------------------------------------
-# Final information
+# Final message
 # ---------------------------------------------------------------------------
 
 echo
 echo "============================================================"
-echo " Nextcloud AIO installation completed"
+echo " Nextcloud AIO is ready for initial configuration"
 echo "============================================================"
 echo
-echo "Nextcloud:"
-echo "  https://$aio_domain"
+echo "AIO setup interface:"
 echo
-echo "AIO management:"
-echo "  http://127.0.0.1:8080"
+echo "  http://$SERVER_IP:8080"
 echo
-echo "AIO Apache backend:"
-echo "  http://127.0.0.1:11222"
-echo
-echo "Data directory:"
-echo "  /mnt/ncdata"
-echo
-echo "AIO directory:"
+echo "AIO mastercontainer:"
 echo "  $AIO_DIR"
 echo
-echo "Apache proxy configuration:"
-echo "  $PROXY_CONF"
+echo "AIO backend:"
+echo "  127.0.0.1:11222"
 echo
-echo "Virtualmin domain:"
-echo "  $aio_domain"
+echo "Nextcloud domain:"
+echo "  https://$aio_domain"
 echo
-echo "Installation log:"
+echo "IMPORTANT:"
+echo
+echo "  Complete the Nextcloud AIO setup through port 8080 first."
+echo
+echo "  DO NOT configure the Apache reverse proxy yet."
+echo "  Port 11222 will become available only after AIO setup."
+echo
+echo "After AIO setup is complete, run the separate proxy"
+echo "configuration script."
+echo
+echo "Log:"
 echo "  $LOG_FILE"
 echo
-echo "Installation state:"
-echo "  $STATE_FILE"
-echo
 echo "============================================================"
+echo
+
+mark_done "setup_ready"
