@@ -1,7 +1,9 @@
 #!/bin/bash
+
 set -euo pipefail
 
 [[ "${DEBUG:-}" == "true" ]] && set -x
+
 export DEBIAN_FRONTEND=noninteractive
 
 LOG_FILE="/var/log/setup_script.log"
@@ -10,19 +12,9 @@ STATE_FILE="/root/.setup_state"
 touch "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
-handle_error() {
-    local exit_code=$?
-    local line_number=$1
-    echo "❌ Error occurred at line $line_number. Exit code: $exit_code" | tee -a "$LOG_FILE"
-    exit "$exit_code"
-}
-
-cleanup() {
-    :
-}
-
-trap 'handle_error $LINENO' ERR
-trap cleanup EXIT
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 log_step() {
     echo "🔄 $1" | tee -a "$LOG_FILE"
@@ -36,12 +28,40 @@ log_error() {
     echo "❌ $1" | tee -a "$LOG_FILE" >&2
 }
 
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+handle_error() {
+    local exit_code=$?
+    local line_number=$1
+
+    echo
+    log_error "Error occurred at line $line_number. Exit code: $exit_code"
+    log_error "Full log: $LOG_FILE"
+    echo
+
+    exit "$exit_code"
+}
+
+cleanup() {
+    :
+}
+
+trap 'handle_error $LINENO' ERR
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
 step_done() {
     grep -qxF "$1" "$STATE_FILE" 2>/dev/null
 }
 
 mark_done() {
-    grep -qxF "$1" "$STATE_FILE" 2>/dev/null || echo "$1" >> "$STATE_FILE"
+    grep -qxF "$1" "$STATE_FILE" 2>/dev/null || \
+        echo "$1" >> "$STATE_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -71,22 +91,26 @@ OS_CODENAME="${VERSION_CODENAME:-}"
 log_step "Detected operating system: ${PRETTY_NAME:-unknown}"
 
 if [[ "$OS_ID" != "debian" ]]; then
-    log_error "This script is intended for Debian. Detected: ${OS_ID:-unknown}"
+    log_error "This script is intended for Debian."
+    log_error "Detected: ${OS_ID:-unknown}"
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Architecture check
+#
+# This installation is intended for x86_64/AMD64.
 # ---------------------------------------------------------------------------
 
 ARCH="$(dpkg --print-architecture)"
 
 case "$ARCH" in
-    amd64|arm64|armhf)
+    amd64)
         log_success "Supported architecture detected: $ARCH"
         ;;
     *)
-        log_error "Unsupported architecture: $ARCH"
+        log_error "This installation requires AMD64/x86_64."
+        log_error "Detected architecture: $ARCH"
         exit 1
         ;;
 esac
@@ -96,9 +120,11 @@ esac
 # ---------------------------------------------------------------------------
 
 if ! step_done "backup"; then
+
     log_step "Creating backup of important configuration files"
 
     BACKUP_DIR="/root/pre_install_backup_$(date +%Y%m%d_%H%M%S)"
+
     mkdir -p "$BACKUP_DIR"
 
     for file in \
@@ -118,25 +144,31 @@ if ! step_done "backup"; then
     done
 
     log_success "Backup created at $BACKUP_DIR"
+
     mark_done "backup"
+
 else
-    log_success "Backup already done, skipping"
+
+    log_success "Backup already done, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
 # Verify root SSH keys
 #
-# We use the existing root authorized_keys to give the new administrator
-# account SSH-key access. No password is created or requested.
+# The administrator account receives the same SSH public keys as root.
+# Password authentication over SSH will subsequently be disabled.
 # ---------------------------------------------------------------------------
 
 ROOT_AUTH_KEYS="/root/.ssh/authorized_keys"
 
 if [[ ! -s "$ROOT_AUTH_KEYS" ]]; then
+
     log_error "No /root/.ssh/authorized_keys found."
-    log_error "The script will not create a password-based administrator."
     log_error "Install your SSH key for root first, then run this script again."
+
     exit 1
+
 fi
 
 log_success "Root SSH authorized_keys found."
@@ -148,6 +180,7 @@ log_success "Root SSH authorized_keys found."
 if ! step_done "admin_user"; then
 
     read -rp "Enter administrator username (default: goodmin): " sudo_user
+
     sudo_user="${sudo_user:-goodmin}"
 
     if ! [[ "$sudo_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
@@ -160,9 +193,16 @@ if ! step_done "admin_user"; then
         exit 1
     fi
 
+    # Save username so it can be recovered on later runs.
+    echo "$sudo_user" > /root/.virtualmin_admin_user
+    chmod 600 /root/.virtualmin_admin_user
+
     if id -u "$sudo_user" &>/dev/null; then
+
         log_success "User '$sudo_user' already exists."
+
     else
+
         log_step "Creating administrator user '$sudo_user'"
 
         useradd \
@@ -171,7 +211,59 @@ if ! step_done "admin_user"; then
             "$sudo_user"
 
         log_success "User '$sudo_user' created."
+
     fi
+
+    # -----------------------------------------------------------------------
+    # Administrator password
+    #
+    # This password is NOT used for SSH.
+    #
+    # SSH remains key-based.
+    #
+    # The password is required so the administrator account has a normal
+    # system password for Virtualmin/Webmin/local authentication.
+    # -----------------------------------------------------------------------
+
+    echo
+    echo "============================================================"
+    echo " Administrator password"
+    echo "============================================================"
+    echo
+    echo "Create a password for '$sudo_user'."
+    echo
+    echo "This password is separate from SSH authentication."
+    echo "SSH will use your SSH key."
+    echo
+
+    while true; do
+
+        read -rsp "Password: " sudo_user_password
+        echo
+
+        if [[ ${#sudo_user_password} -lt 12 ]]; then
+            echo "Password must contain at least 12 characters."
+            continue
+        fi
+
+        read -rsp "Confirm password: " sudo_user_password_confirm
+        echo
+
+        if [[ "$sudo_user_password" != "$sudo_user_password_confirm" ]]; then
+            echo "Passwords do not match. Please try again."
+            continue
+        fi
+
+        break
+
+    done
+
+    printf '%s:%s\n' "$sudo_user" "$sudo_user_password" | chpasswd
+
+    unset sudo_user_password
+    unset sudo_user_password_confirm
+
+    log_success "Password created for '$sudo_user'."
 
     # -----------------------------------------------------------------------
     # Passwordless sudo
@@ -186,9 +278,13 @@ EOF
     chmod 0440 "/etc/sudoers.d/$sudo_user"
 
     if ! visudo -cf "/etc/sudoers.d/$sudo_user" >/dev/null; then
+
         log_error "Invalid sudoers configuration."
+
         rm -f "/etc/sudoers.d/$sudo_user"
+
         exit 1
+
     fi
 
     # -----------------------------------------------------------------------
@@ -211,35 +307,95 @@ EOF
 
     log_success "SSH keys copied to '$sudo_user'."
 
-    # -----------------------------------------------------------------------
-    # Add user to Docker group later if Docker is installed.
-    # -----------------------------------------------------------------------
-
     mark_done "admin_user"
 
 else
+
     log_success "Administrator user already configured, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
-# Recover administrator username when re-running the script
+# Recover administrator username when re-running
 # ---------------------------------------------------------------------------
 
 if [[ -z "${sudo_user:-}" ]]; then
-    read -rp "Enter administrator username (default: goodmin): " sudo_user
-    sudo_user="${sudo_user:-goodmin}"
+
+    if [[ -f /root/.virtualmin_admin_user ]]; then
+
+        sudo_user="$(cat /root/.virtualmin_admin_user)"
+
+    else
+
+        read -rp "Enter administrator username (default: goodmin): " sudo_user
+
+        sudo_user="${sudo_user:-goodmin}"
+
+    fi
+
 fi
 
 if ! id -u "$sudo_user" &>/dev/null; then
+
     log_error "Administrator user '$sudo_user' does not exist."
+
     exit 1
+
+fi
+
+USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
+USER_GROUP="$(id -gn "$sudo_user")"
+
+# ---------------------------------------------------------------------------
+# Step 1b: SSH hardening
+#
+# SSH remains key-only.
+# The password created above is NOT used for SSH.
+# ---------------------------------------------------------------------------
+
+if ! step_done "ssh_hardening"; then
+
+    log_step "Configuring SSH for key-based authentication"
+
+    SSH_CONFIG="/etc/ssh/sshd_config"
+
+    cp -a "$SSH_CONFIG" "${SSH_CONFIG}.pre-virtualmin-$(date +%Y%m%d_%H%M%S)"
+
+    # Remove previous settings so we don't create conflicting directives.
+    sed -i \
+        -e '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' \
+        -e '/^[[:space:]]*KbdInteractiveAuthentication[[:space:]]/d' \
+        -e '/^[[:space:]]*ChallengeResponseAuthentication[[:space:]]/d' \
+        -e '/^[[:space:]]*PermitRootLogin[[:space:]]/d' \
+        "$SSH_CONFIG"
+
+    cat >> "$SSH_CONFIG" <<'EOF'
+
+# Managed by initiate.sh
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin prohibit-password
+EOF
+
+    sshd -t
+
+    systemctl restart ssh
+
+    log_success "SSH configured for key-based authentication."
+
+    mark_done "ssh_hardening"
+
+else
+
+    log_success "SSH hardening already completed, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Minimal system preparation
 #
 # Do NOT run apt upgrade before Virtualmin.
-# Virtualmin expects a fresh supported OS and manages its own packages.
 # ---------------------------------------------------------------------------
 
 if ! step_done "system_prepare"; then
@@ -257,23 +413,26 @@ if ! step_done "system_prepare"; then
         btop \
         tmux \
         wget \
-        lsb-release
+        lsb-release \
+        openssl
 
     log_success "System preparation complete."
 
     mark_done "system_prepare"
 
 else
+
     log_success "System preparation already completed, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
 # Step 3: Debian 13 cloud-init handling
 #
-# Debian 13 currently declares cloud-init and firewalld as conflicting.
-# Virtualmin needs Firewalld for its normal firewall/fail2ban setup.
+# Debian 13 cloud-init conflicts with the Firewalld setup required by the
+# current Virtualmin environment.
 #
-# Only perform this removal on Debian 13.
+# Only perform this on Debian 13.
 # ---------------------------------------------------------------------------
 
 if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
@@ -285,7 +444,6 @@ if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
 
             log_step "Debian 13 detected: disabling cloud-init"
 
-            # Stop any active cloud-init services.
             systemctl stop \
                 cloud-init.service \
                 cloud-init-local.service \
@@ -293,7 +451,6 @@ if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
                 cloud-final.service \
                 2>/dev/null || true
 
-            # Disable them if present.
             systemctl disable \
                 cloud-init.service \
                 cloud-init-local.service \
@@ -301,7 +458,6 @@ if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
                 cloud-final.service \
                 2>/dev/null || true
 
-            # Mask remaining units before removal.
             systemctl mask \
                 cloud-init.service \
                 cloud-init-local.service \
@@ -314,7 +470,6 @@ if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
             apt-get purge -y cloud-init
             apt-get autoremove -y
 
-            # Remove cloud-init state/configuration.
             rm -rf \
                 /etc/cloud \
                 /var/lib/cloud
@@ -324,17 +479,23 @@ if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
             log_success "cloud-init removed from Debian 13."
 
         else
+
             log_success "cloud-init is not installed on Debian 13."
+
         fi
 
         mark_done "debian13_cloudinit"
 
     else
+
         log_success "Debian 13 cloud-init handling already completed, skipping."
+
     fi
 
 else
+
     log_success "Not Debian 13 — cloud-init left untouched."
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -344,14 +505,20 @@ fi
 if ! step_done "stack_selected"; then
 
     while true; do
-        read -rp "Install LAMP (Apache) or LEMP (Nginx)? (LAMP/LEMP): " stack_choice
+
+        read -rp \
+            "Install LAMP (Apache) or LEMP (Nginx)? (LAMP/LEMP): " \
+            stack_choice
+
         stack_choice="$(echo "$stack_choice" | tr '[:lower:]' '[:upper:]')"
 
-        if [[ "$stack_choice" == "LAMP" || "$stack_choice" == "LEMP" ]]; then
+        if [[ "$stack_choice" == "LAMP" ||
+              "$stack_choice" == "LEMP" ]]; then
             break
         fi
 
         echo "Please enter LAMP or LEMP."
+
     done
 
     echo "$stack_choice" > /root/.virtualmin_stack
@@ -361,14 +528,15 @@ if ! step_done "stack_selected"; then
     mark_done "stack_selected"
 
 else
+
     stack_choice="$(cat /root/.virtualmin_stack)"
+
     log_success "Using previously selected stack: $stack_choice"
+
 fi
 
 # ---------------------------------------------------------------------------
 # Step 5: Hostname
-#
-# Virtualmin should use a fully qualified domain name.
 # ---------------------------------------------------------------------------
 
 if ! step_done "hostname"; then
@@ -381,16 +549,18 @@ if ! step_done "hostname"; then
     echo
 
     read -rp "Enter hostname [$CURRENT_HOSTNAME]: " hostname
+
     hostname="${hostname:-$CURRENT_HOSTNAME}"
 
-    # Lowercase hostname.
     hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
 
-    # Validate FQDN.
     if ! [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+
         log_error "Invalid hostname: $hostname"
-        log_error "Virtualmin requires a fully qualified domain name such as server.example.com"
+        log_error "Use a fully qualified hostname such as server.example.com"
+
         exit 1
+
     fi
 
     hostnamectl set-hostname "$hostname"
@@ -402,17 +572,17 @@ if ! step_done "hostname"; then
     mark_done "hostname"
 
 else
+
     hostname="$(cat /root/.virtualmin_hostname)"
+
     log_success "Using existing hostname: $hostname"
+
 fi
 
 # ---------------------------------------------------------------------------
 # Step 6: Virtualmin installation
 #
-# Use the official current Virtualmin installer.
-# No --force.
-# No repository modifications.
-# No ARM-specific workarounds.
+# Official current Virtualmin installer.
 # ---------------------------------------------------------------------------
 
 if ! step_done "virtualmin"; then
@@ -431,14 +601,56 @@ if ! step_done "virtualmin"; then
     mark_done "virtualmin"
 
 else
+
     log_success "Virtualmin already installed, skipping."
+
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6b: Ensure Firewalld and Fail2ban are fully installed
+#
+# Virtualmin normally installs/configures these, but we explicitly verify
+# and enable them so the final server has the services we expect.
+# ---------------------------------------------------------------------------
+
+if ! step_done "security_services"; then
+
+    log_step "Ensuring Firewalld and Fail2ban are installed"
+
+    apt-get update
+
+    apt-get install -y \
+        firewalld \
+        fail2ban
+
+    systemctl enable --now firewalld
+    systemctl enable --now fail2ban
+
+    if ! systemctl is-active --quiet firewalld; then
+        log_error "Firewalld is not running."
+        exit 1
+    fi
+
+    if ! systemctl is-active --quiet fail2ban; then
+        log_error "Fail2ban is not running."
+        exit 1
+    fi
+
+    log_success "Firewalld installed and running."
+    log_success "Fail2ban installed and running."
+
+    mark_done "security_services"
+
+else
+
+    log_success "Firewalld and Fail2ban already configured, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
 # Step 7: Docker installation
 #
-# Use Docker's official Debian repository.
-# Docker supports Debian 13/Trixie and multiple architectures.
+# Official Docker Debian repository.
 # ---------------------------------------------------------------------------
 
 OS_ID="$(. /etc/os-release && echo "$ID")"
@@ -449,7 +661,6 @@ if ! step_done "docker"; then
 
     log_step "Installing Docker from the official Docker repository"
 
-    # Remove conflicting distribution packages if present.
     apt-get remove -y \
         docker.io \
         docker-compose \
@@ -497,7 +708,9 @@ EOF
     mark_done "docker"
 
 else
+
     log_success "Docker already installed, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -510,9 +723,6 @@ log_success "User '$sudo_user' added to the Docker group."
 
 # ---------------------------------------------------------------------------
 # Step 8: Portainer
-#
-# Use Portainer's multi-architecture LTS image.
-# No architecture-specific image names are required.
 # ---------------------------------------------------------------------------
 
 if ! step_done "portainer"; then
@@ -522,7 +732,7 @@ if ! step_done "portainer"; then
     docker volume inspect portainer_data >/dev/null 2>&1 || \
         docker volume create portainer_data >/dev/null
 
-    PORTAINER_DIR="/home/$sudo_user/portainer"
+    PORTAINER_DIR="$USER_HOME/portainer"
 
     mkdir -p "$PORTAINER_DIR"
 
@@ -530,24 +740,28 @@ if ! step_done "portainer"; then
 name: portainer
 
 services:
+
   portainer-ce:
     image: portainer/portainer-ce:lts
     container_name: portainer
     restart: unless-stopped
+
     ports:
       - "127.0.0.1:8000:8000"
       - "127.0.0.1:9443:9443"
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - portainer_data:/data
 
 volumes:
+
   portainer_data:
     external: true
     name: portainer_data
 EOF
 
-    chown -R "$sudo_user:$(id -gn "$sudo_user")" "$PORTAINER_DIR"
+    chown -R "$sudo_user:$USER_GROUP" "$PORTAINER_DIR"
 
     (
         cd "$PORTAINER_DIR"
@@ -555,8 +769,11 @@ EOF
     )
 
     if ! docker ps --format '{{.Names}}' | grep -qx "portainer"; then
+
         log_error "Portainer container failed to start."
+
         exit 1
+
     fi
 
     log_success "Portainer started successfully."
@@ -564,7 +781,9 @@ EOF
     mark_done "portainer"
 
 else
+
     log_success "Portainer already installed, skipping."
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -574,16 +793,23 @@ fi
 install_nc="n"
 
 if [[ -f /root/.nextcloud_choice ]]; then
+
     install_nc="$(cat /root/.nextcloud_choice)"
+
 else
+
     read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
+
     install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
+
     echo "$install_nc" > /root/.nextcloud_choice
+
 fi
 
 if [[ "$install_nc" =~ ^y$ ]]; then
 
     if [[ ! -x /root/install-nextcloud-aio.sh ]]; then
+
         log_step "Downloading Nextcloud AIO installation script"
 
         curl -fsSL \
@@ -593,11 +819,14 @@ if [[ "$install_nc" =~ ^y$ ]]; then
         chmod 700 /root/install-nextcloud-aio.sh
 
         log_success "Nextcloud AIO installer downloaded."
+
     fi
 
     log_step "Starting Nextcloud AIO installation"
 
-    /root/install-nextcloud-aio.sh
+    # Pass the administrator username so the AIO project is created under
+    # /home/$sudo_user rather than /root.
+    /root/install-nextcloud-aio.sh "$sudo_user"
 
     log_success "Nextcloud AIO installation script completed."
 
@@ -653,30 +882,43 @@ echo "============================================================"
 echo "Operating System : ${PRETTY_NAME:-unknown}"
 echo "Architecture     : $ARCH"
 echo "Hostname         : $hostname"
-echo "Virtualmin stack  : $stack_choice"
+echo "Virtualmin stack : $stack_choice"
 echo "Administrator    : $sudo_user"
-echo "SSH authentication: SSH key"
+echo "SSH authentication: SSH key only"
 echo "Sudo             : NOPASSWD"
 echo "Docker           : installed"
 echo "Portainer        : installed"
+echo "Fail2ban         : installed"
+echo "Firewalld        : installed"
 echo "NextCloud-AIO    : $([[ "$install_nc" =~ ^y$ ]] && echo "installed" || echo "not installed")"
 echo "============================================================"
 echo
+
 echo "Access:"
-echo "Virtualmin: https://$hostname:10000"
-echo "Portainer : https://127.0.0.1:9443"
-echo
+echo "Virtualmin/Webmin: https://$hostname:10000"
+echo "Portainer        : https://127.0.0.1:9443"
 
 if [[ "$install_nc" =~ ^y$ ]]; then
-    echo "NextCloud AIO administration:"
-    echo "https://$hostname:8080"
+
     echo
+    echo "NextCloud AIO:"
+    echo "AIO setup interface: http://SERVER-IP:8080"
+    echo
+    echo "Complete the AIO setup before configuring the Apache"
+    echo "reverse proxy to port 11222."
+
 fi
 
-echo "Portainer is bound to localhost."
-echo "Use an SSH tunnel or configure a reverse proxy to access it remotely."
 echo
-echo "Setup log: $LOG_FILE"
-echo "State file: $STATE_FILE"
+echo "SSH:"
+echo "  Password authentication: disabled"
+echo "  Root login: SSH key only"
+echo "  Administrator login: SSH key"
+echo
+echo "Setup log:"
+echo "  $LOG_FILE"
+echo
+echo "State file:"
+echo "  $STATE_FILE"
 echo
 echo "Installation completed successfully."
