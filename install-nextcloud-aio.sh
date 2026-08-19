@@ -80,6 +80,7 @@ ARCH="$(dpkg --print-architecture)"
 case "$OS_ID" in
 
     debian)
+
         case "$OS_VERSION_ID" in
             12|13)
                 ;;
@@ -88,9 +89,11 @@ case "$OS_ID" in
                 exit 1
                 ;;
         esac
+
         ;;
 
     ubuntu)
+
         case "$OS_VERSION_ID" in
             22.04|24.04)
                 ;;
@@ -99,11 +102,14 @@ case "$OS_ID" in
                 exit 1
                 ;;
         esac
+
         ;;
 
     *)
+
         log_error "Unsupported operating system: $OS_ID"
         exit 1
+
         ;;
 
 esac
@@ -115,17 +121,23 @@ esac
 case "$ARCH" in
 
     amd64)
+
         AIO_IMAGE="ghcr.io/nextcloud-releases/all-in-one:latest"
+
         ;;
 
     arm64)
+
         AIO_IMAGE="ghcr.io/nextcloud-releases/all-in-one:latest-arm64"
+
         ;;
 
     *)
+
         log_error "Unsupported architecture: $ARCH"
         log_error "Supported architectures: amd64 and arm64"
         exit 1
+
         ;;
 
 esac
@@ -139,16 +151,22 @@ log_success "AIO image: $AIO_IMAGE"
 # ============================================================================
 
 if [[ $# -ne 1 ]]; then
+
     log_error "Usage:"
     log_error "$0 <administrator-username>"
+
     exit 1
+
 fi
 
 sudo_user="$1"
 
 if ! id -u "$sudo_user" >/dev/null 2>&1; then
+
     log_error "Administrator user '$sudo_user' does not exist."
+
     exit 1
+
 fi
 
 USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
@@ -158,21 +176,32 @@ USER_GROUP="$(id -gn "$sudo_user")"
 # Required software
 # ============================================================================
 
-for command in docker curl openssl virtualmin apache2ctl; do
+for command in docker curl openssl virtualmin apache2ctl a2enmod; do
+
     if ! command -v "$command" >/dev/null 2>&1; then
+
         log_error "Required command not found: $command"
+
         exit 1
+
     fi
+
 done
 
 if ! docker compose version >/dev/null 2>&1; then
+
     log_error "Docker Compose plugin not found."
+
     exit 1
+
 fi
 
 if ! systemctl is-active --quiet docker; then
+
     log_error "Docker is not running."
+
     exit 1
+
 fi
 
 # ============================================================================
@@ -198,13 +227,19 @@ else
         aio_domain="$(echo "$aio_domain" | tr '[:upper:]' '[:lower:]' | xargs)"
 
         if [[ -z "$aio_domain" ]]; then
+
             echo "Domain cannot be empty."
+
             continue
+
         fi
 
         if ! [[ "$aio_domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+
             echo "Invalid domain."
+
             continue
+
         fi
 
         break
@@ -212,6 +247,7 @@ else
     done
 
     printf '%s\n' "$aio_domain" > "$DOMAIN_FILE"
+
     chmod 600 "$DOMAIN_FILE"
 
 fi
@@ -219,7 +255,7 @@ fi
 log_success "Nextcloud domain: $aio_domain"
 
 # ============================================================================
-# Create Virtualmin domain
+# Virtualmin domain
 # ============================================================================
 
 if virtualmin list-domains --name-only 2>/dev/null \
@@ -323,7 +359,7 @@ chown "$sudo_user:$USER_GROUP" "$AIO_COMPOSE"
 chmod 640 "$AIO_COMPOSE"
 
 # ============================================================================
-# Pull image
+# Pull AIO image
 # ============================================================================
 
 log_step "Pulling Nextcloud AIO image"
@@ -383,7 +419,7 @@ fi
 log_success "Correct AIO image confirmed."
 
 # ============================================================================
-# Locate Virtualmin's virtual-server library
+# Locate Virtualmin library
 # ============================================================================
 
 VIRTUAL_SERVER_LIB=""
@@ -394,52 +430,61 @@ for candidate in \
 do
 
     if [[ -f "$candidate" ]]; then
+
         VIRTUAL_SERVER_LIB="$candidate"
+
         break
+
     fi
 
 done
 
 if [[ -z "$VIRTUAL_SERVER_LIB" ]]; then
+
     log_error "Virtualmin virtual-server-lib.pl could not be found."
+
     exit 1
+
 fi
 
-log_success "Virtualmin library:"
+log_success "Virtualmin library found:"
 echo "  $VIRTUAL_SERVER_LIB"
 
 # ============================================================================
-# Add AIO directives to SSL VirtualHost through Virtualmin's own API
+# Create REAL Virtualmin helper script
 #
 # IMPORTANT:
 #
-# We intentionally DO NOT use:
+# Do NOT use:
 #
-#   virtualmin modify-web --add-directive
+#     perl -
 #
-# because Virtualmin's modify-web implementation applies those directives
-# to both the HTTP and HTTPS VirtualHosts.
-#
-# Instead we use:
-#
-#   get_apache_virtual(domain, ssl_port)
-#   apache::save_directive(...)
-#
-# directly against the SSL VirtualHost.
+# Webmin/Virtualmin requires scripts to be executed using a full path.
 # ============================================================================
 
-log_step "Adding AIO directives to the Virtualmin SSL VirtualHost"
+VIRTUALMIN_SSL_SCRIPT="/root/.nextcloud-aio-virtualmin-ssl.pl"
 
-perl - "$VIRTUAL_SERVER_LIB" "$aio_domain" "$AIO_BINDING" "$AIO_PORT" <<'PERL'
+log_step "Preparing Virtualmin SSL configuration helper"
+
+cat > "$VIRTUALMIN_SSL_SCRIPT" <<'PERL'
+#!/usr/bin/perl
+
 use strict;
 use warnings;
 
 my ($lib, $domain_name, $binding, $port) = @ARGV;
 
+die "Usage: $0 <virtual-server-lib.pl> <domain> <binding> <port>\n"
+    unless defined($lib) &&
+           defined($domain_name) &&
+           defined($binding) &&
+           defined($port);
+
 $ENV{'WEBMIN_CONFIG'} ||= "/etc/webmin";
 $ENV{'WEBMIN_VAR'} ||= "/var/webmin";
 
 my $libdir = $lib;
+
 $libdir =~ s{/virtual-server-lib\.pl$}{};
 
 chdir($libdir)
@@ -447,266 +492,32 @@ chdir($libdir)
 
 require "./virtual-server-lib.pl";
 
-$< == 0
-    or die "This operation must run as root\n";
-
 &require_apache();
 
 my $domain = &get_domain_by("dom", $domain_name);
 
-$domain
-    or die "Virtualmin domain '$domain_name' does not exist\n";
+die "Virtualmin domain '$domain_name' does not exist\n"
+    unless $domain;
 
-$domain->{'ssl'}
-    or die "Virtualmin domain '$domain_name' does not have SSL enabled\n";
-
-my $ssl_port = $domain->{'web_sslport'} || 443;
-
-my ($virt, $vconf, $conf) =
-    &get_apache_virtual($domain_name, $ssl_port);
-
-$virt
-    or die "Could not locate SSL VirtualHost for $domain_name on port $ssl_port\n";
-
-$vconf
-    or die "Could not read SSL VirtualHost configuration for $domain_name\n";
-
-# --------------------------------------------------------------------------
-# Helper
-# --------------------------------------------------------------------------
-
-sub set_directive {
-    my ($name, $value) = @_;
-
-    my @existing =
-        &apache::find_directive($name, $vconf);
-
-    # Do not create duplicates.
-    @existing =
-        grep { $_ ne $value } @existing;
-
-    push @existing, $value;
-
-    &apache::save_directive(
-        $name,
-        \@existing,
-        $vconf,
-        $conf
-    );
-}
-
-sub remove_directive {
-    my ($name, $match) = @_;
-
-    my @existing =
-        &apache::find_directive($name, $vconf);
-
-    if (defined($match)) {
-        @existing =
-            grep { $_ ne $match } @existing;
-    }
-    else {
-        @existing = ();
-    }
-
-    &apache::save_directive(
-        $name,
-        \@existing,
-        $vconf,
-        $conf
-    );
-}
-
-# --------------------------------------------------------------------------
-# Remove old AIO directives if this script is being run again.
-# --------------------------------------------------------------------------
-
-remove_directive(
-    "ProxyPreserveHost"
-);
-
-remove_directive(
-    "RequestHeader",
-    'set X-Real-IP %{REMOTE_ADDR}s'
-);
-
-remove_directive(
-    "RequestHeader",
-    'set X-Forwarded-Proto "https"'
-);
-
-remove_directive(
-    "AllowEncodedSlashes"
-);
-
-remove_directive(
-    "ProxyPass",
-    " / http://$binding:$port/ nocanon"
-);
-
-remove_directive(
-    "ProxyPassReverse",
-    " / http://$binding:$port/"
-);
-
-remove_directive(
-    "Protocols"
-);
-
-remove_directive(
-    "H2WindowSize"
-);
-
-remove_directive(
-    "LimitRequestBody"
-);
-
-remove_directive(
-    "Timeout"
-);
-
-remove_directive(
-    "ProxyTimeout"
-);
-
-# --------------------------------------------------------------------------
-# Add the AIO directives.
-# --------------------------------------------------------------------------
-
-set_directive(
-    "ProxyPreserveHost",
-    "On"
-);
-
-set_directive(
-    "RequestHeader",
-    'set X-Real-IP %{REMOTE_ADDR}s'
-);
-
-set_directive(
-    "RequestHeader",
-    'set X-Forwarded-Proto "https"'
-);
-
-set_directive(
-    "AllowEncodedSlashes",
-    "NoDecode"
-);
-
-set_directive(
-    "ProxyPass",
-    "/ http://$binding:$port/ nocanon"
-);
-
-set_directive(
-    "ProxyPassReverse",
-    "/ http://$binding:$port/"
-);
-
-set_directive(
-    "Protocols",
-    "h2 h2c http/1.1"
-);
-
-set_directive(
-    "H2WindowSize",
-    "5242880"
-);
-
-set_directive(
-    "LimitRequestBody",
-    "0"
-);
-
-set_directive(
-    "Timeout",
-    "86400"
-);
-
-set_directive(
-    "ProxyTimeout",
-    "86400"
-);
-
-# --------------------------------------------------------------------------
-# WebSocket directives.
-#
-# These need to be represented as RewriteCond/RewriteRule directives.
-# Virtualmin's Apache directive structure supports these as individual
-# directives.
-# --------------------------------------------------------------------------
-
-set_directive(
-    "RewriteCond",
-    '%{HTTP:Upgrade} websocket [NC]'
-);
-
-set_directive(
-    "RewriteCond",
-    '%{HTTP:Connection} upgrade [NC]'
-);
-
-set_directive(
-    "RewriteRule",
-    '.? ws://127.0.0.1:' . $port . '/%1 [P,L,UnsafeAllow3F]'
-);
-
-# --------------------------------------------------------------------------
-# Save and flush the exact Virtualmin-managed SSL vhost.
-# --------------------------------------------------------------------------
-
-&flush_file_lines($virt->{'file'});
-
-print "SSL VirtualHost updated successfully\n";
-print "Domain: $domain_name\n";
-print "SSL port: $ssl_port\n";
-print "Configuration file managed by Virtualmin: $virt->{'file'}\n";
-
-exit 0;
-
-PERL
-
-log_success "AIO directives written through Virtualmin's SSL VirtualHost API."
-
-# ============================================================================
-# Verify through Virtualmin's Apache configuration structure
-# ============================================================================
-
-log_step "Verifying AIO directives in the SSL VirtualHost"
-
-perl - "$VIRTUAL_SERVER_LIB" "$aio_domain" "$AIO_BINDING" "$AIO_PORT" <<'PERL'
-use strict;
-use warnings;
-
-my ($lib, $domain_name, $binding, $port) = @ARGV;
-
-$ENV{'WEBMIN_CONFIG'} ||= "/etc/webmin";
-$ENV{'WEBMIN_VAR'} ||= "/var/webmin";
-
-my $libdir = $lib;
-$libdir =~ s{/virtual-server-lib\.pl$}{};
-
-chdir($libdir)
-    or die "Cannot change directory: $!\n";
-
-require "./virtual-server-lib.pl";
-
-&require_apache();
-
-my $domain = &get_domain_by("dom", $domain_name);
-
-$domain
-    or die "Domain not found\n";
+die "Virtualmin domain '$domain_name' does not have SSL enabled\n"
+    unless $domain->{'ssl'};
 
 my $ssl_port = $domain->{'web_sslport'} || 443;
 
 my ($virt, $vconf, $conf) =
-    &get_apache_virtual($domain_name, $ssl_port);
+    &get_apache_virtual(
+        $domain_name,
+        $ssl_port
+    );
 
-$virt
-    or die "SSL VirtualHost not found\n";
+die "Could not locate SSL VirtualHost for $domain_name on port $ssl_port\n"
+    unless $virt && $vconf;
 
-my @required = (
+# ============================================================================
+# Remove previously installed AIO directives.
+# ============================================================================
+
+my @remove_exact = (
 
     [ "ProxyPreserveHost", "On" ],
 
@@ -736,6 +547,26 @@ my @required = (
     ],
 
     [
+        "RewriteCond",
+        '%{HTTP:Upgrade} websocket [NC]'
+    ],
+
+    [
+        "RewriteCond",
+        '%{HTTP:Connection} upgrade [NC]'
+    ],
+
+    [
+        "RewriteCond",
+        '%{THE_REQUEST} "^[a-zA-Z]+ /(.*) HTTP/\\d+(\\.\\d+)?$"'
+    ],
+
+    [
+        "RewriteRule",
+        '.? "ws://127.0.0.1:' . $port . '/%1" [P,L,UnsafeAllow3F]'
+    ],
+
+    [
         "Protocols",
         "h2 h2c http/1.1"
     ],
@@ -745,19 +576,259 @@ my @required = (
         "5242880"
     ],
 
+);
+
+foreach my $item (@remove_exact) {
+
+    my ($name, $value) = @$item;
+
+    my @values =
+        &apache::find_directive(
+            $name,
+            $vconf
+        );
+
+    @values =
+        grep {
+            $_ ne $value
+        } @values;
+
+    &apache::save_directive(
+        $name,
+        \@values,
+        $vconf,
+        $conf
+    );
+}
+
+# ============================================================================
+# Remove old AIO RewriteEngine if present.
+# ============================================================================
+
+my @rewrite_engine =
+    &apache::find_directive(
+        "RewriteEngine",
+        $vconf
+    );
+
+@rewrite_engine =
+    grep {
+        $_ ne "On"
+    } @rewrite_engine;
+
+&apache::save_directive(
+    "RewriteEngine",
+    \@rewrite_engine,
+    $vconf,
+    $conf
+);
+
+# ============================================================================
+# Add directives.
+# ============================================================================
+
+sub add_directive {
+    my ($name, $value) = @_;
+
+    my @values =
+        &apache::find_directive(
+            $name,
+            $vconf
+        );
+
+    push @values, $value
+        unless grep {
+            $_ eq $value
+        } @values;
+
+    &apache::save_directive(
+        $name,
+        \@values,
+        $vconf,
+        $conf
+    );
+}
+
+add_directive(
+    "RewriteEngine",
+    "On"
+);
+
+add_directive(
+    "ProxyPreserveHost",
+    "On"
+);
+
+add_directive(
+    "RequestHeader",
+    'set X-Real-IP %{REMOTE_ADDR}s'
+);
+
+add_directive(
+    "RequestHeader",
+    'set X-Forwarded-Proto "https"'
+);
+
+add_directive(
+    "AllowEncodedSlashes",
+    "NoDecode"
+);
+
+add_directive(
+    "ProxyPass",
+    "/ http://127.0.0.1:" . $port . "/ nocanon"
+);
+
+add_directive(
+    "ProxyPassReverse",
+    "/ http://127.0.0.1:" . $port . "/"
+);
+
+add_directive(
+    "RewriteCond",
+    '%{HTTP:Upgrade} websocket [NC]'
+);
+
+add_directive(
+    "RewriteCond",
+    '%{HTTP:Connection} upgrade [NC]'
+);
+
+add_directive(
+    "RewriteCond",
+    '%{THE_REQUEST} "^[a-zA-Z]+ /(.*) HTTP/\\d+(\\.\\d+)?$"'
+);
+
+add_directive(
+    "RewriteRule",
+    '.? "ws://127.0.0.1:' . $port . '/%1" [P,L,UnsafeAllow3F]'
+);
+
+add_directive(
+    "Protocols",
+    "h2 h2c http/1.1"
+);
+
+add_directive(
+    "H2WindowSize",
+    "5242880"
+);
+
+# ============================================================================
+# Save through Virtualmin's Apache configuration system.
+# ============================================================================
+
+&flush_file_lines(
+    $virt->{'file'}
+);
+
+print "Virtualmin SSL VirtualHost updated successfully\n";
+print "Domain: $domain_name\n";
+print "SSL port: $ssl_port\n";
+print "File: $virt->{'file'}\n";
+
+exit 0;
+
+PERL
+
+chmod 700 "$VIRTUALMIN_SSL_SCRIPT"
+
+# ============================================================================
+# Execute helper using FULL PATH
+# ============================================================================
+
+log_step "Adding AIO directives to the Virtualmin SSL VirtualHost"
+
+/usr/bin/perl \
+    "$VIRTUALMIN_SSL_SCRIPT" \
+    "$VIRTUAL_SERVER_LIB" \
+    "$aio_domain" \
+    "$AIO_BINDING" \
+    "$AIO_PORT"
+
+rm -f "$VIRTUALMIN_SSL_SCRIPT"
+
+log_success "AIO directives added through Virtualmin."
+
+# ============================================================================
+# Verify Virtualmin SSL VirtualHost
+# ============================================================================
+
+VIRTUALMIN_VERIFY_SCRIPT="/root/.nextcloud-aio-verify-ssl.pl"
+
+cat > "$VIRTUALMIN_VERIFY_SCRIPT" <<'PERL'
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+my ($lib, $domain_name, $binding, $port) = @ARGV;
+
+die "Invalid arguments\n"
+    unless defined($lib) &&
+           defined($domain_name) &&
+           defined($binding) &&
+           defined($port);
+
+$ENV{'WEBMIN_CONFIG'} ||= "/etc/webmin";
+$ENV{'WEBMIN_VAR'} ||= "/var/webmin";
+
+my $libdir = $lib;
+
+$libdir =~ s{/virtual-server-lib\.pl$}{};
+
+chdir($libdir)
+    or die "Cannot change to Virtualmin library directory: $!\n";
+
+require "./virtual-server-lib.pl";
+
+&require_apache();
+
+my $domain = &get_domain_by("dom", $domain_name);
+
+die "Virtualmin domain not found\n"
+    unless $domain;
+
+my $ssl_port = $domain->{'web_sslport'} || 443;
+
+my ($virt, $vconf, $conf) =
+    &get_apache_virtual(
+        $domain_name,
+        $ssl_port
+    );
+
+die "SSL VirtualHost not found\n"
+    unless $virt && $vconf;
+
+my @required = (
+
+    [ "RewriteEngine", "On" ],
+
+    [ "ProxyPreserveHost", "On" ],
+
     [
-        "LimitRequestBody",
-        "0"
+        "RequestHeader",
+        'set X-Real-IP %{REMOTE_ADDR}s'
     ],
 
     [
-        "Timeout",
-        "86400"
+        "RequestHeader",
+        'set X-Forwarded-Proto "https"'
     ],
 
     [
-        "ProxyTimeout",
-        "86400"
+        "AllowEncodedSlashes",
+        "NoDecode"
+    ],
+
+    [
+        "ProxyPass",
+        "/ http://127.0.0.1:" . $port . "/ nocanon"
+    ],
+
+    [
+        "ProxyPassReverse",
+        "/ http://127.0.0.1:" . $port . "/"
     ],
 
     [
@@ -771,27 +842,45 @@ my @required = (
     ],
 
     [
+        "RewriteCond",
+        '%{THE_REQUEST} "^[a-zA-Z]+ /(.*) HTTP/\\d+(\\.\\d+)?$"'
+    ],
+
+    [
         "RewriteRule",
-        '.? ws://127.0.0.1:' . $port . '/%1 [P,L,UnsafeAllow3F]'
+        '.? "ws://127.0.0.1:' . $port . '/%1" [P,L,UnsafeAllow3F]'
+    ],
+
+    [
+        "Protocols",
+        "h2 h2c http/1.1"
+    ],
+
+    [
+        "H2WindowSize",
+        "5242880"
     ],
 
 );
 
 my @missing;
 
-foreach my $r (@required) {
+foreach my $item (@required) {
 
-    my ($name, $value) = @$r;
+    my ($name, $value) = @$item;
 
-    my @found =
-        &apache::find_directive($name, $vconf);
+    my @values =
+        &apache::find_directive(
+            $name,
+            $vconf
+        );
 
-    my $ok = grep {
+    my $found = grep {
         $_ eq $value
-    } @found;
+    } @values;
 
     push @missing, "$name $value"
-        unless $ok;
+        unless $found;
 }
 
 if (@missing) {
@@ -801,16 +890,31 @@ if (@missing) {
     print STDERR "  $_\n"
         foreach @missing;
 
-    die "SSL VirtualHost verification failed\n";
+    die "Virtualmin SSL VirtualHost verification failed\n";
 }
 
-print "All required AIO directives are present in the SSL VirtualHost\n";
+print "All AIO directives verified in the SSL VirtualHost\n";
 print "Domain: $domain_name\n";
 print "SSL port: $ssl_port\n";
 
+exit 0;
+
 PERL
 
-log_success "Virtualmin confirms all AIO directives are in the SSL VirtualHost."
+chmod 700 "$VIRTUALMIN_VERIFY_SCRIPT"
+
+log_step "Verifying AIO directives through Virtualmin"
+
+/usr/bin/perl \
+    "$VIRTUALMIN_VERIFY_SCRIPT" \
+    "$VIRTUAL_SERVER_LIB" \
+    "$aio_domain" \
+    "$AIO_BINDING" \
+    "$AIO_PORT"
+
+rm -f "$VIRTUALMIN_VERIFY_SCRIPT"
+
+log_success "Virtualmin confirms all AIO directives are present."
 
 # ============================================================================
 # Apache configuration test
@@ -836,33 +940,7 @@ log_step "Reloading Apache"
 
 systemctl reload apache2
 
-log_success "Apache reloaded."
-
-# ============================================================================
-# Firewall
-# ============================================================================
-
-if command -v firewall-cmd >/dev/null 2>&1; then
-
-    if systemctl is-active --quiet firewalld; then
-
-        if ! firewall-cmd \
-            --permanent \
-            --query-port=8080/tcp >/dev/null 2>&1; then
-
-            firewall-cmd \
-                --permanent \
-                --add-port=8080/tcp
-
-        fi
-
-        firewall-cmd --reload
-
-        log_success "Firewall port 8080 opened."
-
-    fi
-
-fi
+log_success "Apache reloaded successfully."
 
 # ============================================================================
 # Verify AIO interface
@@ -883,6 +961,7 @@ for i in {1..60}; do
         >/dev/null 2>&1; then
 
         AIO_READY=true
+
         break
 
     fi
@@ -906,12 +985,21 @@ fi
 log_success "AIO interface is available."
 
 # ============================================================================
-# Final state
+# State
 # ============================================================================
 
-echo "aio_mastercontainer" >> "$STATE_FILE"
-echo "aio_ssl_virtualhost" >> "$STATE_FILE"
-echo "aio_apache" >> "$STATE_FILE"
+grep -qxF "aio_mastercontainer" "$STATE_FILE" 2>/dev/null || \
+    echo "aio_mastercontainer" >> "$STATE_FILE"
+
+grep -qxF "aio_ssl_virtualhost" "$STATE_FILE" 2>/dev/null || \
+    echo "aio_ssl_virtualhost" >> "$STATE_FILE"
+
+grep -qxF "aio_apache" "$STATE_FILE" 2>/dev/null || \
+    echo "aio_apache" >> "$STATE_FILE"
+
+# ============================================================================
+# Final
+# ============================================================================
 
 SERVER_IP="$(hostname -I | awk '{print $1}')"
 
@@ -929,7 +1017,7 @@ echo
 echo "AIO image:"
 echo "  $AIO_IMAGE"
 echo
-echo "AIO internal Apache:"
+echo "AIO Apache:"
 echo "  $AIO_BINDING:$AIO_PORT"
 echo
 echo "AIO management interface:"
@@ -937,19 +1025,22 @@ echo
 echo "  https://$SERVER_IP:8080"
 echo
 echo "============================================================"
-echo " SSL VIRTUALHOST"
+echo
+echo "The AIO reverse-proxy directives have been added to"
+echo "the SSL VirtualHost through Virtualmin."
+echo
+echo "Apache configuration was tested successfully."
+echo
 echo "============================================================"
 echo
-echo "AIO reverse-proxy directives have been added through"
-echo "Virtualmin's own SSL VirtualHost configuration."
+echo "IMPORTANT:"
 echo
-echo "They are NOT added to the HTTP VirtualHost."
+echo "Open the AIO management interface using the SERVER IP,"
+echo "not the domain:"
 echo
-echo "Virtualmin SSL directives can be viewed at:"
+echo "  https://$SERVER_IP:8080"
 echo
-echo "  Services → Configure SSL Website → Edit Directives"
-echo
-echo "for:"
+echo "Then enter and validate:"
 echo
 echo "  $aio_domain"
 echo
