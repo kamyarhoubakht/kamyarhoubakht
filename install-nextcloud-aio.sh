@@ -4,30 +4,17 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ============================================================================
-# Nextcloud AIO installation
-#
-# Called by initiate.sh as:
-#
-#   /root/install-nextcloud-aio.sh "$sudo_user"
-#
-# The administrator user is used for the project/Compose files.
-#
-# AIO itself remains a system Docker service.
-#
-# ============================================================================
-
 LOG_FILE="/var/log/nextcloud-aio-install.log"
 STATE_FILE="/root/.nextcloud_aio_state"
 DOMAIN_FILE="/root/.nextcloud_aio_domain"
 
-mkdir -p "$(dirname "$LOG_FILE")"
+AIO_PORT="11222"
+AIO_BINDING="127.0.0.1"
 
-touch "$LOG_FILE"
-touch "$STATE_FILE"
+mkdir -p /var/log
 
-chmod 600 "$LOG_FILE"
-chmod 600 "$STATE_FILE"
+touch "$LOG_FILE" "$STATE_FILE"
+chmod 600 "$LOG_FILE" "$STATE_FILE"
 
 # ============================================================================
 # Logging
@@ -55,10 +42,10 @@ handle_error() {
     local line_number=$1
 
     echo
-    log_error "Nextcloud AIO installation failed."
+    log_error "Installation failed."
     log_error "Line: $line_number"
     log_error "Exit code: $exit_code"
-    log_error "Log file: $LOG_FILE"
+    log_error "Log: $LOG_FILE"
     echo
 
     exit "$exit_code"
@@ -67,20 +54,7 @@ handle_error() {
 trap 'handle_error $LINENO' ERR
 
 # ============================================================================
-# State helpers
-# ============================================================================
-
-step_done() {
-    grep -qxF "$1" "$STATE_FILE" 2>/dev/null
-}
-
-mark_done() {
-    grep -qxF "$1" "$STATE_FILE" 2>/dev/null || \
-        echo "$1" >> "$STATE_FILE"
-}
-
-# ============================================================================
-# Root check
+# Root
 # ============================================================================
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -89,12 +63,84 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 # ============================================================================
-# Administrator user
+# Operating system
+# ============================================================================
+
+if [[ ! -f /etc/os-release ]]; then
+    log_error "Cannot determine operating system."
+    exit 1
+fi
+
+. /etc/os-release
+
+OS_ID="${ID:-}"
+OS_VERSION_ID="${VERSION_ID:-}"
+ARCH="$(dpkg --print-architecture)"
+
+case "$OS_ID" in
+
+    debian)
+        case "$OS_VERSION_ID" in
+            12|13)
+                ;;
+            *)
+                log_error "Unsupported Debian version: $OS_VERSION_ID"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    ubuntu)
+        case "$OS_VERSION_ID" in
+            22.04|24.04)
+                ;;
+            *)
+                log_error "Unsupported Ubuntu version: $OS_VERSION_ID"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        log_error "Unsupported operating system: $OS_ID"
+        exit 1
+        ;;
+
+esac
+
+# ============================================================================
+# Architecture
+# ============================================================================
+
+case "$ARCH" in
+
+    amd64)
+        AIO_IMAGE="ghcr.io/nextcloud-releases/all-in-one:latest"
+        ;;
+
+    arm64)
+        AIO_IMAGE="ghcr.io/nextcloud-releases/all-in-one:latest-arm64"
+        ;;
+
+    *)
+        log_error "Unsupported architecture: $ARCH"
+        log_error "Supported architectures: amd64 and arm64"
+        exit 1
+        ;;
+
+esac
+
+log_success "Operating system: ${PRETTY_NAME:-unknown}"
+log_success "Architecture: $ARCH"
+log_success "AIO image: $AIO_IMAGE"
+
+# ============================================================================
+# Administrator
 # ============================================================================
 
 if [[ $# -ne 1 ]]; then
     log_error "Usage:"
-    log_error "  $0 <sudo_admin_username>"
+    log_error "$0 <administrator-username>"
     exit 1
 fi
 
@@ -108,19 +154,11 @@ fi
 USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
 USER_GROUP="$(id -gn "$sudo_user")"
 
-if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
-    log_error "Could not determine home directory for '$sudo_user'."
-    exit 1
-fi
-
-log_success "Administrator user: $sudo_user"
-log_success "Administrator home: $USER_HOME"
-
 # ============================================================================
-# Required commands
+# Required software
 # ============================================================================
 
-for command in docker curl virtualmin apache2ctl openssl; do
+for command in docker curl openssl virtualmin apache2ctl; do
     if ! command -v "$command" >/dev/null 2>&1; then
         log_error "Required command not found: $command"
         exit 1
@@ -128,77 +166,29 @@ for command in docker curl virtualmin apache2ctl openssl; do
 done
 
 if ! docker compose version >/dev/null 2>&1; then
-    log_error "Docker Compose plugin is not available."
+    log_error "Docker Compose plugin not found."
     exit 1
 fi
-
-# ============================================================================
-# Docker service
-# ============================================================================
 
 if ! systemctl is-active --quiet docker; then
-    log_error "Docker is installed but is not running."
+    log_error "Docker is not running."
     exit 1
 fi
 
-log_success "Docker is running."
-
 # ============================================================================
-# Ask for AIO domain
-#
-# This is a completely independent top-level Virtualmin domain.
-#
-# It does NOT require:
-#   - a parent Virtualmin domain
-#   - a parent server
-#   - mail
-#   - www
-#   - admin
-#   - FTP
-#   - DNS management by Virtualmin
-#
-# It exists only so Apache can serve as the reverse proxy.
+# Domain
 # ============================================================================
 
 if [[ -f "$DOMAIN_FILE" ]]; then
 
     aio_domain="$(cat "$DOMAIN_FILE")"
 
-    if [[ -n "$aio_domain" ]]; then
-
-        echo
-        echo "Existing Nextcloud AIO domain:"
-        echo
-        echo "  $aio_domain"
-        echo
-
-        read -rp "Use this domain? (Y/n): " reuse_domain
-
-        reuse_domain="${reuse_domain:-y}"
-        reuse_domain="$(echo "$reuse_domain" | tr '[:upper:]' '[:lower:]')"
-
-        if [[ "$reuse_domain" != "y" ]]; then
-            rm -f "$DOMAIN_FILE"
-        fi
-
-    fi
-fi
-
-if [[ ! -f "$DOMAIN_FILE" ]]; then
+else
 
     echo
     echo "============================================================"
     echo " Nextcloud AIO domain"
     echo "============================================================"
-    echo
-    echo "Enter the complete hostname that will be used for Nextcloud."
-    echo
-    echo "Example:"
-    echo
-    echo "  cloud.example.com"
-    echo
-    echo "This will be created as an independent Virtualmin domain."
-    echo "It does not need a parent Virtualmin domain."
     echo
 
     while true; do
@@ -213,14 +203,12 @@ if [[ ! -f "$DOMAIN_FILE" ]]; then
         fi
 
         if ! [[ "$aio_domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
-            echo
-            echo "Invalid domain: $aio_domain"
-            echo "Example: cloud.example.com"
-            echo
+            echo "Invalid domain."
             continue
         fi
 
         break
+
     done
 
     printf '%s\n' "$aio_domain" > "$DOMAIN_FILE"
@@ -228,25 +216,20 @@ if [[ ! -f "$DOMAIN_FILE" ]]; then
 
 fi
 
-log_success "Nextcloud AIO domain: $aio_domain"
+log_success "Nextcloud domain: $aio_domain"
 
 # ============================================================================
-# Virtualmin domain
-#
-# Create a minimal independent domain.
-#
-# Apache/web functionality is required.
-# Mail, DNS, FTP and other Virtualmin services are not required.
+# Create Virtualmin domain
 # ============================================================================
 
 if virtualmin list-domains --name-only 2>/dev/null \
     | grep -Fxq "$aio_domain"; then
 
-    log_success "Virtualmin domain already exists: $aio_domain"
+    log_success "Virtualmin domain already exists."
 
 else
 
-    log_step "Creating independent Virtualmin domain"
+    log_step "Creating Virtualmin domain"
 
     DOMAIN_PASSWORD="$(openssl rand -base64 48)"
 
@@ -269,7 +252,7 @@ fi
 # Apache modules
 # ============================================================================
 
-log_step "Enabling Apache modules required for the AIO reverse proxy"
+log_step "Enabling Apache modules"
 
 a2enmod \
     proxy \
@@ -281,79 +264,36 @@ a2enmod \
     ssl \
     >/dev/null
 
-log_success "Required Apache modules enabled."
-
-# ============================================================================
-# Reload Apache
-# ============================================================================
-
 apache2ctl configtest
 
 systemctl reload apache2
 
-log_success "Apache configuration is valid."
+log_success "Apache modules enabled."
 
 # ============================================================================
-# AIO project directory
-#
-# IMPORTANT:
-#
-# This is deliberately NOT:
-#
-#   /root/nextcloud-aio
-#
-# It belongs to the administrator account.
+# AIO directory
 # ============================================================================
 
 AIO_DIR="$USER_HOME/nextcloud-aio"
 AIO_COMPOSE="$AIO_DIR/docker-compose.yaml"
 
-if [[ ! -d "$AIO_DIR" ]]; then
-
-    log_step "Creating AIO project directory"
-
-    mkdir -p "$AIO_DIR"
-
-fi
+mkdir -p "$AIO_DIR"
 
 chown "$sudo_user:$USER_GROUP" "$AIO_DIR"
 chmod 750 "$AIO_DIR"
 
-log_success "AIO project directory: $AIO_DIR"
-
 # ============================================================================
 # Docker Compose
-#
-# This follows the official AIO reverse-proxy architecture:
-#
-#   public:
-#       8080 -> AIO mastercontainer interface
-#
-#   localhost only:
-#       11222 -> AIO Apache
-#
-# Apache on the host will eventually proxy:
-#
-#       HTTPS 443
-#           ↓
-#       127.0.0.1:11222
-#
-# We deliberately do NOT configure that Apache proxy here.
 # ============================================================================
 
-if [[ -f "$AIO_COMPOSE" ]]; then
+log_step "Creating AIO Docker Compose configuration"
 
-    log_success "Existing AIO Compose file found."
-
-else
-
-    log_step "Creating Nextcloud AIO Docker Compose file"
-
-    cat > "$AIO_COMPOSE" <<'EOF'
+cat > "$AIO_COMPOSE" <<EOF
 services:
 
   nextcloud-aio-mastercontainer:
-    image: ghcr.io/nextcloud-releases/all-in-one:latest
+
+    image: $AIO_IMAGE
 
     init: true
 
@@ -366,27 +306,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
     ports:
-
-      # AIO setup/management interface.
-      #
-      # This is intentionally publicly reachable because the initial AIO
-      # configuration is performed through this interface.
       - "8080:8080"
-
-      # AIO's internal Apache.
-      #
-      # MUST remain localhost-only because the host Apache reverse proxy
-      # connects to it.
-      - "127.0.0.1:11222:11222"
+      - "$AIO_BINDING:$AIO_PORT:$AIO_PORT"
 
     environment:
-
-      # AIO Apache port used by the external Apache reverse proxy.
-      - APACHE_PORT=11222
-
-      # The reverse proxy is on this same server.
-      # Therefore Apache only needs to be reachable through localhost.
-      - APACHE_IP_BINDING=127.0.0.1
+      APACHE_PORT: $AIO_PORT
+      APACHE_IP_BINDING: $AIO_BINDING
 
 volumes:
 
@@ -394,102 +319,558 @@ volumes:
     name: nextcloud_aio_mastercontainer
 EOF
 
-    chown "$sudo_user:$USER_GROUP" "$AIO_COMPOSE"
-    chmod 640 "$AIO_COMPOSE"
-
-    log_success "AIO Compose file created."
-
-fi
-
-# ============================================================================
-# Ensure ownership is correct even if the Compose file already existed
-# ============================================================================
-
-chown -R "$sudo_user:$USER_GROUP" "$AIO_DIR"
-
-chmod 750 "$AIO_DIR"
+chown "$sudo_user:$USER_GROUP" "$AIO_COMPOSE"
 chmod 640 "$AIO_COMPOSE"
 
 # ============================================================================
-# Validate Compose
+# Pull image
 # ============================================================================
 
-log_step "Validating Docker Compose configuration"
+log_step "Pulling Nextcloud AIO image"
+
+docker pull "$AIO_IMAGE"
+
+# ============================================================================
+# Start AIO
+# ============================================================================
+
+log_step "Starting Nextcloud AIO"
 
 (
     cd "$AIO_DIR"
-    docker compose config >/dev/null
+
+    docker compose pull
+    docker compose up -d --force-recreate
 )
 
-log_success "Docker Compose configuration is valid."
+sleep 5
+
+if ! docker ps --format '{{.Names}}' \
+    | grep -qx "nextcloud-aio-mastercontainer"; then
+
+    log_error "AIO mastercontainer did not start."
+
+    docker logs \
+        --tail 100 \
+        nextcloud-aio-mastercontainer || true
+
+    exit 1
+
+fi
+
+log_success "AIO mastercontainer running."
 
 # ============================================================================
-# Firewalld
+# Verify image
+# ============================================================================
+
+RUNNING_IMAGE="$(
+    docker inspect \
+        --format '{{.Config.Image}}' \
+        nextcloud-aio-mastercontainer
+)"
+
+if [[ "$RUNNING_IMAGE" != "$AIO_IMAGE" ]]; then
+
+    log_error "Wrong AIO image is running."
+    log_error "Expected: $AIO_IMAGE"
+    log_error "Running: $RUNNING_IMAGE"
+
+    exit 1
+
+fi
+
+log_success "Correct AIO image confirmed."
+
+# ============================================================================
+# Locate Virtualmin's virtual-server library
+# ============================================================================
+
+VIRTUAL_SERVER_LIB=""
+
+for candidate in \
+    /usr/share/webmin/virtual-server/virtual-server-lib.pl \
+    /usr/libexec/webmin/virtual-server/virtual-server-lib.pl
+do
+
+    if [[ -f "$candidate" ]]; then
+        VIRTUAL_SERVER_LIB="$candidate"
+        break
+    fi
+
+done
+
+if [[ -z "$VIRTUAL_SERVER_LIB" ]]; then
+    log_error "Virtualmin virtual-server-lib.pl could not be found."
+    exit 1
+fi
+
+log_success "Virtualmin library:"
+echo "  $VIRTUAL_SERVER_LIB"
+
+# ============================================================================
+# Add AIO directives to SSL VirtualHost through Virtualmin's own API
 #
-# Port 8080 is intentionally opened because the user needs direct access
-# to the AIO interface.
+# IMPORTANT:
 #
-# Port 11222 is NOT opened.
+# We intentionally DO NOT use:
 #
-# It is bound to 127.0.0.1 anyway.
+#   virtualmin modify-web --add-directive
+#
+# because Virtualmin's modify-web implementation applies those directives
+# to both the HTTP and HTTPS VirtualHosts.
+#
+# Instead we use:
+#
+#   get_apache_virtual(domain, ssl_port)
+#   apache::save_directive(...)
+#
+# directly against the SSL VirtualHost.
+# ============================================================================
+
+log_step "Adding AIO directives to the Virtualmin SSL VirtualHost"
+
+perl - "$VIRTUAL_SERVER_LIB" "$aio_domain" "$AIO_BINDING" "$AIO_PORT" <<'PERL'
+use strict;
+use warnings;
+
+my ($lib, $domain_name, $binding, $port) = @ARGV;
+
+$ENV{'WEBMIN_CONFIG'} ||= "/etc/webmin";
+$ENV{'WEBMIN_VAR'} ||= "/var/webmin";
+
+my $libdir = $lib;
+$libdir =~ s{/virtual-server-lib\.pl$}{};
+
+chdir($libdir)
+    or die "Cannot change to Virtualmin library directory: $!\n";
+
+require "./virtual-server-lib.pl";
+
+$< == 0
+    or die "This operation must run as root\n";
+
+&require_apache();
+
+my $domain = &get_domain_by("dom", $domain_name);
+
+$domain
+    or die "Virtualmin domain '$domain_name' does not exist\n";
+
+$domain->{'ssl'}
+    or die "Virtualmin domain '$domain_name' does not have SSL enabled\n";
+
+my $ssl_port = $domain->{'web_sslport'} || 443;
+
+my ($virt, $vconf, $conf) =
+    &get_apache_virtual($domain_name, $ssl_port);
+
+$virt
+    or die "Could not locate SSL VirtualHost for $domain_name on port $ssl_port\n";
+
+$vconf
+    or die "Could not read SSL VirtualHost configuration for $domain_name\n";
+
+# --------------------------------------------------------------------------
+# Helper
+# --------------------------------------------------------------------------
+
+sub set_directive {
+    my ($name, $value) = @_;
+
+    my @existing =
+        &apache::find_directive($name, $vconf);
+
+    # Do not create duplicates.
+    @existing =
+        grep { $_ ne $value } @existing;
+
+    push @existing, $value;
+
+    &apache::save_directive(
+        $name,
+        \@existing,
+        $vconf,
+        $conf
+    );
+}
+
+sub remove_directive {
+    my ($name, $match) = @_;
+
+    my @existing =
+        &apache::find_directive($name, $vconf);
+
+    if (defined($match)) {
+        @existing =
+            grep { $_ ne $match } @existing;
+    }
+    else {
+        @existing = ();
+    }
+
+    &apache::save_directive(
+        $name,
+        \@existing,
+        $vconf,
+        $conf
+    );
+}
+
+# --------------------------------------------------------------------------
+# Remove old AIO directives if this script is being run again.
+# --------------------------------------------------------------------------
+
+remove_directive(
+    "ProxyPreserveHost"
+);
+
+remove_directive(
+    "RequestHeader",
+    'set X-Real-IP %{REMOTE_ADDR}s'
+);
+
+remove_directive(
+    "RequestHeader",
+    'set X-Forwarded-Proto "https"'
+);
+
+remove_directive(
+    "AllowEncodedSlashes"
+);
+
+remove_directive(
+    "ProxyPass",
+    " / http://$binding:$port/ nocanon"
+);
+
+remove_directive(
+    "ProxyPassReverse",
+    " / http://$binding:$port/"
+);
+
+remove_directive(
+    "Protocols"
+);
+
+remove_directive(
+    "H2WindowSize"
+);
+
+remove_directive(
+    "LimitRequestBody"
+);
+
+remove_directive(
+    "Timeout"
+);
+
+remove_directive(
+    "ProxyTimeout"
+);
+
+# --------------------------------------------------------------------------
+# Add the AIO directives.
+# --------------------------------------------------------------------------
+
+set_directive(
+    "ProxyPreserveHost",
+    "On"
+);
+
+set_directive(
+    "RequestHeader",
+    'set X-Real-IP %{REMOTE_ADDR}s'
+);
+
+set_directive(
+    "RequestHeader",
+    'set X-Forwarded-Proto "https"'
+);
+
+set_directive(
+    "AllowEncodedSlashes",
+    "NoDecode"
+);
+
+set_directive(
+    "ProxyPass",
+    "/ http://$binding:$port/ nocanon"
+);
+
+set_directive(
+    "ProxyPassReverse",
+    "/ http://$binding:$port/"
+);
+
+set_directive(
+    "Protocols",
+    "h2 h2c http/1.1"
+);
+
+set_directive(
+    "H2WindowSize",
+    "5242880"
+);
+
+set_directive(
+    "LimitRequestBody",
+    "0"
+);
+
+set_directive(
+    "Timeout",
+    "86400"
+);
+
+set_directive(
+    "ProxyTimeout",
+    "86400"
+);
+
+# --------------------------------------------------------------------------
+# WebSocket directives.
+#
+# These need to be represented as RewriteCond/RewriteRule directives.
+# Virtualmin's Apache directive structure supports these as individual
+# directives.
+# --------------------------------------------------------------------------
+
+set_directive(
+    "RewriteCond",
+    '%{HTTP:Upgrade} websocket [NC]'
+);
+
+set_directive(
+    "RewriteCond",
+    '%{HTTP:Connection} upgrade [NC]'
+);
+
+set_directive(
+    "RewriteRule",
+    '.? ws://127.0.0.1:' . $port . '/%1 [P,L,UnsafeAllow3F]'
+);
+
+# --------------------------------------------------------------------------
+# Save and flush the exact Virtualmin-managed SSL vhost.
+# --------------------------------------------------------------------------
+
+&flush_file_lines($virt->{'file'});
+
+print "SSL VirtualHost updated successfully\n";
+print "Domain: $domain_name\n";
+print "SSL port: $ssl_port\n";
+print "Configuration file managed by Virtualmin: $virt->{'file'}\n";
+
+exit 0;
+
+PERL
+
+log_success "AIO directives written through Virtualmin's SSL VirtualHost API."
+
+# ============================================================================
+# Verify through Virtualmin's Apache configuration structure
+# ============================================================================
+
+log_step "Verifying AIO directives in the SSL VirtualHost"
+
+perl - "$VIRTUAL_SERVER_LIB" "$aio_domain" "$AIO_BINDING" "$AIO_PORT" <<'PERL'
+use strict;
+use warnings;
+
+my ($lib, $domain_name, $binding, $port) = @ARGV;
+
+$ENV{'WEBMIN_CONFIG'} ||= "/etc/webmin";
+$ENV{'WEBMIN_VAR'} ||= "/var/webmin";
+
+my $libdir = $lib;
+$libdir =~ s{/virtual-server-lib\.pl$}{};
+
+chdir($libdir)
+    or die "Cannot change directory: $!\n";
+
+require "./virtual-server-lib.pl";
+
+&require_apache();
+
+my $domain = &get_domain_by("dom", $domain_name);
+
+$domain
+    or die "Domain not found\n";
+
+my $ssl_port = $domain->{'web_sslport'} || 443;
+
+my ($virt, $vconf, $conf) =
+    &get_apache_virtual($domain_name, $ssl_port);
+
+$virt
+    or die "SSL VirtualHost not found\n";
+
+my @required = (
+
+    [ "ProxyPreserveHost", "On" ],
+
+    [
+        "RequestHeader",
+        'set X-Real-IP %{REMOTE_ADDR}s'
+    ],
+
+    [
+        "RequestHeader",
+        'set X-Forwarded-Proto "https"'
+    ],
+
+    [
+        "AllowEncodedSlashes",
+        "NoDecode"
+    ],
+
+    [
+        "ProxyPass",
+        "/ http://127.0.0.1:" . $port . "/ nocanon"
+    ],
+
+    [
+        "ProxyPassReverse",
+        "/ http://127.0.0.1:" . $port . "/"
+    ],
+
+    [
+        "Protocols",
+        "h2 h2c http/1.1"
+    ],
+
+    [
+        "H2WindowSize",
+        "5242880"
+    ],
+
+    [
+        "LimitRequestBody",
+        "0"
+    ],
+
+    [
+        "Timeout",
+        "86400"
+    ],
+
+    [
+        "ProxyTimeout",
+        "86400"
+    ],
+
+    [
+        "RewriteCond",
+        '%{HTTP:Upgrade} websocket [NC]'
+    ],
+
+    [
+        "RewriteCond",
+        '%{HTTP:Connection} upgrade [NC]'
+    ],
+
+    [
+        "RewriteRule",
+        '.? ws://127.0.0.1:' . $port . '/%1 [P,L,UnsafeAllow3F]'
+    ],
+
+);
+
+my @missing;
+
+foreach my $r (@required) {
+
+    my ($name, $value) = @$r;
+
+    my @found =
+        &apache::find_directive($name, $vconf);
+
+    my $ok = grep {
+        $_ eq $value
+    } @found;
+
+    push @missing, "$name $value"
+        unless $ok;
+}
+
+if (@missing) {
+
+    print STDERR "Missing directives:\n";
+
+    print STDERR "  $_\n"
+        foreach @missing;
+
+    die "SSL VirtualHost verification failed\n";
+}
+
+print "All required AIO directives are present in the SSL VirtualHost\n";
+print "Domain: $domain_name\n";
+print "SSL port: $ssl_port\n";
+
+PERL
+
+log_success "Virtualmin confirms all AIO directives are in the SSL VirtualHost."
+
+# ============================================================================
+# Apache configuration test
+# ============================================================================
+
+log_step "Testing Apache configuration"
+
+if ! apache2ctl configtest; then
+
+    log_error "Apache configuration test FAILED."
+
+    exit 1
+
+fi
+
+log_success "Apache configuration is valid."
+
+# ============================================================================
+# Reload Apache
+# ============================================================================
+
+log_step "Reloading Apache"
+
+systemctl reload apache2
+
+log_success "Apache reloaded."
+
+# ============================================================================
+# Firewall
 # ============================================================================
 
 if command -v firewall-cmd >/dev/null 2>&1; then
 
     if systemctl is-active --quiet firewalld; then
 
-        log_step "Opening AIO port 8080 in Firewalld"
+        if ! firewall-cmd \
+            --permanent \
+            --query-port=8080/tcp >/dev/null 2>&1; then
 
-        if ! firewall-cmd --permanent --query-port=8080/tcp >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=8080/tcp
+            firewall-cmd \
+                --permanent \
+                --add-port=8080/tcp
+
         fi
 
         firewall-cmd --reload
 
-        log_success "Firewalld allows TCP port 8080."
-
-    else
-
-        log_error "Firewalld is installed but not running."
-        exit 1
+        log_success "Firewall port 8080 opened."
 
     fi
-
-else
-
-    log_error "firewall-cmd was not found."
-    exit 1
 
 fi
 
 # ============================================================================
-# Start / recreate AIO mastercontainer
-#
-# IMPORTANT:
-#
-# We only wait for port 8080.
-#
-# We DO NOT wait for 11222.
-#
-# AIO's Apache container is created/started as part of the AIO setup process.
+# Verify AIO interface
 # ============================================================================
 
-log_step "Starting Nextcloud AIO mastercontainer"
+log_step "Checking AIO interface"
 
-(
-    cd "$AIO_DIR"
-    docker compose up -d
-)
-
-log_success "AIO mastercontainer started."
-
-# ============================================================================
-# Wait for AIO interface on 8080 only
-# ============================================================================
-
-log_step "Waiting for AIO interface on port 8080"
-
-aio_ready=false
+AIO_READY=false
 
 for i in {1..60}; do
 
@@ -498,10 +879,10 @@ for i in {1..60}; do
         --show-error \
         --insecure \
         --max-time 3 \
-        https://127.0.0.1:8080/ \
+        "https://127.0.0.1:8080/" \
         >/dev/null 2>&1; then
 
-        aio_ready=true
+        AIO_READY=true
         break
 
     fi
@@ -510,138 +891,67 @@ for i in {1..60}; do
 
 done
 
-if [[ "$aio_ready" != true ]]; then
+if [[ "$AIO_READY" != true ]]; then
 
-    log_error "AIO interface did not become available on port 8080."
-
-    echo
-    echo "============================================================"
-    echo " Docker container status"
-    echo "============================================================"
-
-    docker ps -a \
-        --filter "name=nextcloud-aio-mastercontainer"
-
-    echo
-    echo "============================================================"
-    echo " Recent AIO logs"
-    echo "============================================================"
+    log_error "AIO interface is not responding on port 8080."
 
     docker logs \
-        --tail 150 \
+        --tail 100 \
         nextcloud-aio-mastercontainer || true
 
     exit 1
 
 fi
 
-log_success "AIO interface is available on port 8080."
-
-# ============================================================================
-# Verify port 11222 is NOT publicly bound
-#
-# We do not require it to be listening yet.
-# We only check that Docker has not accidentally published it on 0.0.0.0.
-# ============================================================================
-
-if docker port nextcloud-aio-mastercontainer 11222/tcp 2>/dev/null \
-    | grep -qE '0\.0\.0\.0:11222|\[::\]:11222'; then
-
-    log_error "SECURITY ERROR: port 11222 is publicly exposed."
-    log_error "It must remain bound to 127.0.0.1."
-
-    exit 1
-
-fi
-
-log_success "AIO Apache port 11222 is not publicly exposed."
-
-# ============================================================================
-# Determine server IP
-# ============================================================================
-
-SERVER_IP="$(hostname -I | awk '{print $1}')"
-
-if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP="$(ip route get 1.1.1.1 2>/dev/null \
-        | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-fi
-
-SERVER_IP="${SERVER_IP:-SERVER-IP}"
+log_success "AIO interface is available."
 
 # ============================================================================
 # Final state
 # ============================================================================
 
-mark_done "aio_compose"
-mark_done "aio_virtualmin_domain"
-mark_done "aio_firewall"
-mark_done "aio_mastercontainer"
-mark_done "aio_setup_ready"
+echo "aio_mastercontainer" >> "$STATE_FILE"
+echo "aio_ssl_virtualhost" >> "$STATE_FILE"
+echo "aio_apache" >> "$STATE_FILE"
 
-# ============================================================================
-# Final output
-# ============================================================================
+SERVER_IP="$(hostname -I | awk '{print $1}')"
 
 echo
 echo "============================================================"
 echo " Nextcloud AIO installation prepared"
 echo "============================================================"
 echo
-echo "Administrator:"
+echo "Domain:"
+echo "  $aio_domain"
 echo
-echo "  $sudo_user"
+echo "Architecture:"
+echo "  $ARCH"
 echo
-echo "AIO project:"
+echo "AIO image:"
+echo "  $AIO_IMAGE"
 echo
-echo "  $AIO_DIR"
+echo "AIO internal Apache:"
+echo "  $AIO_BINDING:$AIO_PORT"
 echo
-echo "Compose file:"
+echo "AIO management interface:"
 echo
-echo "  $AIO_COMPOSE"
+echo "  https://$SERVER_IP:8080"
 echo
-echo "Nextcloud domain:"
+echo "============================================================"
+echo " SSL VIRTUALHOST"
+echo "============================================================"
+echo
+echo "AIO reverse-proxy directives have been added through"
+echo "Virtualmin's own SSL VirtualHost configuration."
+echo
+echo "They are NOT added to the HTTP VirtualHost."
+echo
+echo "Virtualmin SSL directives can be viewed at:"
+echo
+echo "  Services → Configure SSL Website → Edit Directives"
+echo
+echo "for:"
 echo
 echo "  $aio_domain"
 echo
-echo "AIO interface:"
-echo
-echo "  https://$SERVER_IP:8080"
-echo
-echo "AIO Apache backend:"
-echo
-echo "  127.0.0.1:11222"
-echo
-echo "Firewall:"
-echo
-echo "  8080/tcp  OPEN"
-echo "  11222/tcp NOT OPEN"
-echo
-echo "============================================================"
-echo " IMPORTANT"
 echo "============================================================"
 echo
-echo "Open the AIO interface using the SERVER IP:"
-echo
-echo "  https://$SERVER_IP:8080"
-echo
-echo "Accept the self-signed certificate warning."
-echo
-echo "Complete the AIO installation there."
-echo
-echo "DO NOT configure the Apache reverse proxy yet."
-echo
-echo "The separate AIO proxy configuration script should be"
-echo "run AFTER the AIO installation has been completed."
-echo
-echo "The AIO Apache service on port 11222 is NOT required"
-echo "to be available at this stage."
-echo
-echo "Log:"
-echo
-echo "  $LOG_FILE"
-echo
-echo "============================================================"
-echo
-
-log_success "Nextcloud AIO preparation completed successfully."
