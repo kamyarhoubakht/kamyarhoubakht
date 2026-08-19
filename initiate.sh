@@ -91,7 +91,6 @@ OS_CODENAME="${VERSION_CODENAME:-}"
 log_step "Detected operating system: ${PRETTY_NAME:-unknown}"
 
 case "$OS_ID" in
-
     debian)
         case "$OS_VERSION_ID" in
             12|13)
@@ -124,23 +123,25 @@ case "$OS_ID" in
         log_error "Detected: ${OS_ID:-unknown} ${OS_VERSION_ID:-unknown}"
         exit 1
         ;;
-
 esac
 
 # ---------------------------------------------------------------------------
 # Architecture check
 #
-# This installation is intended for x86_64/AMD64.
+# Supported by Virtualmin, Docker and Nextcloud AIO:
+#   amd64
+#   arm64
 # ---------------------------------------------------------------------------
 
 ARCH="$(dpkg --print-architecture)"
 
 case "$ARCH" in
-    amd64)
+    amd64|arm64)
         log_success "Supported architecture detected: $ARCH"
         ;;
     *)
-        log_error "This installation requires AMD64/x86_64."
+        log_error "Unsupported architecture."
+        log_error "Supported architectures: amd64, arm64"
         log_error "Detected architecture: $ARCH"
         exit 1
         ;;
@@ -680,10 +681,10 @@ fi
 # Official Docker repository for Debian/Ubuntu.
 # ---------------------------------------------------------------------------
 
-# Re-read OS information in case the environment changed during installation.
 OS_ID="$(. /etc/os-release && echo "$ID")"
 OS_VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID")"
 OS_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+DOCKER_ARCH="$(dpkg --print-architecture)"
 
 case "$OS_ID" in
     debian|ubuntu)
@@ -694,7 +695,14 @@ case "$OS_ID" in
         ;;
 esac
 
-DOCKER_ARCH="$(dpkg --print-architecture)"
+case "$DOCKER_ARCH" in
+    amd64|arm64)
+        ;;
+    *)
+        log_error "Unsupported Docker architecture: $DOCKER_ARCH"
+        exit 1
+        ;;
+esac
 
 if ! step_done "docker"; then
 
