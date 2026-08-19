@@ -91,6 +91,7 @@ OS_CODENAME="${VERSION_CODENAME:-}"
 log_step "Detected operating system: ${PRETTY_NAME:-unknown}"
 
 case "$OS_ID" in
+
     debian)
         case "$OS_VERSION_ID" in
             12|13)
@@ -123,28 +124,42 @@ case "$OS_ID" in
         log_error "Detected: ${OS_ID:-unknown} ${OS_VERSION_ID:-unknown}"
         exit 1
         ;;
+
 esac
 
 # ---------------------------------------------------------------------------
 # Architecture check
 #
-# Supported by Virtualmin, Docker and Nextcloud AIO:
-#   amd64
-#   arm64
+# AMD64 and ARM64 are supported by Docker.
+#
+# IMPORTANT:
+# Virtualmin does not currently officially support ARM64.
 # ---------------------------------------------------------------------------
 
 ARCH="$(dpkg --print-architecture)"
 
 case "$ARCH" in
-    amd64|arm64)
+
+    amd64)
         log_success "Supported architecture detected: $ARCH"
         ;;
+
+    arm64)
+        log_success "ARM64 architecture detected."
+        echo
+        log_error "IMPORTANT: Virtualmin does not currently officially support ARM64."
+        log_error "Docker, Portainer and Nextcloud AIO support ARM64, but Virtualmin"
+        log_error "may refuse to install or may not have ARM64 packages."
+        echo
+        ;;
+
     *)
         log_error "Unsupported architecture."
         log_error "Supported architectures: amd64, arm64"
         log_error "Detected architecture: $ARCH"
         exit 1
         ;;
+
 esac
 
 # ---------------------------------------------------------------------------
@@ -187,9 +202,6 @@ fi
 
 # ---------------------------------------------------------------------------
 # Verify root SSH keys
-#
-# The administrator account receives the same SSH public keys as root.
-# Password authentication over SSH will subsequently be disabled.
 # ---------------------------------------------------------------------------
 
 ROOT_AUTH_KEYS="/root/.ssh/authorized_keys"
@@ -223,7 +235,6 @@ if ! step_done "admin_user"; then
         exit 1
     fi
 
-    # Save username so it can be recovered on later runs.
     echo "$sudo_user" > /root/.virtualmin_admin_user
     chmod 600 /root/.virtualmin_admin_user
 
@@ -243,17 +254,6 @@ if ! step_done "admin_user"; then
         log_success "User '$sudo_user' created."
 
     fi
-
-    # -----------------------------------------------------------------------
-    # Administrator password
-    #
-    # This password is NOT used for SSH.
-    #
-    # SSH remains key-based.
-    #
-    # The password is required so the administrator account has a normal
-    # system password for Virtualmin/Webmin/local authentication.
-    # -----------------------------------------------------------------------
 
     echo
     echo "============================================================"
@@ -378,9 +378,6 @@ USER_GROUP="$(id -gn "$sudo_user")"
 
 # ---------------------------------------------------------------------------
 # Step 1b: SSH hardening
-#
-# SSH remains key-only.
-# The password created above is NOT used for SSH.
 # ---------------------------------------------------------------------------
 
 if ! step_done "ssh_hardening"; then
@@ -391,7 +388,6 @@ if ! step_done "ssh_hardening"; then
 
     cp -a "$SSH_CONFIG" "${SSH_CONFIG}.pre-virtualmin-$(date +%Y%m%d_%H%M%S)"
 
-    # Remove previous settings so we don't create conflicting directives.
     sed -i \
         -e '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' \
         -e '/^[[:space:]]*KbdInteractiveAuthentication[[:space:]]/d' \
@@ -423,8 +419,6 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Minimal system preparation
-#
-# Do NOT run apt upgrade before Virtualmin.
 # ---------------------------------------------------------------------------
 
 if ! step_done "system_prepare"; then
@@ -457,11 +451,6 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 3: Debian 13 cloud-init handling
-#
-# Debian 13 cloud-init conflicts with the Firewalld setup required by the
-# current Virtualmin environment.
-#
-# Only perform this on Debian 13.
 # ---------------------------------------------------------------------------
 
 if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
@@ -609,11 +598,17 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 6: Virtualmin installation
-#
-# Official current Virtualmin installer.
 # ---------------------------------------------------------------------------
 
 if ! step_done "virtualmin"; then
+
+    if [[ "$ARCH" == "arm64" ]]; then
+        echo
+        log_error "IMPORTANT: This is an ARM64 system."
+        log_error "Virtualmin's current installer does not officially support ARM64."
+        log_error "The Virtualmin installation may fail at this point."
+        echo
+    fi
 
     log_step "Installing current Virtualmin using official installer"
 
@@ -636,9 +631,6 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 6b: Ensure Firewalld and Fail2ban are fully installed
-#
-# Virtualmin normally installs/configures these, but we explicitly verify
-# and enable them so the final server has the services we expect.
 # ---------------------------------------------------------------------------
 
 if ! step_done "security_services"; then
@@ -682,7 +674,6 @@ fi
 # ---------------------------------------------------------------------------
 
 OS_ID="$(. /etc/os-release && echo "$ID")"
-OS_VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID")"
 OS_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 DOCKER_ARCH="$(dpkg --print-architecture)"
 
@@ -871,8 +862,6 @@ if [[ "$install_nc" =~ ^y$ ]]; then
 
     log_step "Starting Nextcloud AIO installation"
 
-    # Pass the administrator username so the AIO project is created under
-    # /home/$sudo_user rather than /root.
     /root/install-nextcloud-aio.sh "$sudo_user"
 
     log_success "Nextcloud AIO installation script completed."
