@@ -90,11 +90,42 @@ OS_CODENAME="${VERSION_CODENAME:-}"
 
 log_step "Detected operating system: ${PRETTY_NAME:-unknown}"
 
-if [[ "$OS_ID" != "debian" ]]; then
-    log_error "This script is intended for Debian."
-    log_error "Detected: ${OS_ID:-unknown}"
-    exit 1
-fi
+case "$OS_ID" in
+
+    debian)
+        case "$OS_VERSION_ID" in
+            12|13)
+                log_success "Supported Debian version detected: $OS_VERSION_ID"
+                ;;
+            *)
+                log_error "Unsupported Debian version: $OS_VERSION_ID"
+                log_error "Supported Debian versions: 12, 13"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    ubuntu)
+        case "$OS_VERSION_ID" in
+            22.04|24.04)
+                log_success "Supported Ubuntu version detected: $OS_VERSION_ID"
+                ;;
+            *)
+                log_error "Unsupported Ubuntu version: $OS_VERSION_ID"
+                log_error "Supported Ubuntu versions: 22.04, 24.04 LTS"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        log_error "Unsupported operating system."
+        log_error "This script supports Debian 12/13 and Ubuntu 22.04/24.04 LTS."
+        log_error "Detected: ${OS_ID:-unknown} ${OS_VERSION_ID:-unknown}"
+        exit 1
+        ;;
+
+esac
 
 # ---------------------------------------------------------------------------
 # Architecture check
@@ -163,12 +194,10 @@ fi
 ROOT_AUTH_KEYS="/root/.ssh/authorized_keys"
 
 if [[ ! -s "$ROOT_AUTH_KEYS" ]]; then
-
     log_error "No /root/.ssh/authorized_keys found."
     log_error "Install your SSH key for root first, then run this script again."
 
     exit 1
-
 fi
 
 log_success "Root SSH authorized_keys found."
@@ -370,7 +399,6 @@ if ! step_done "ssh_hardening"; then
         "$SSH_CONFIG"
 
     cat >> "$SSH_CONFIG" <<'EOF'
-
 # Managed by initiate.sh
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -551,7 +579,6 @@ if ! step_done "hostname"; then
     read -rp "Enter hostname [$CURRENT_HOSTNAME]: " hostname
 
     hostname="${hostname:-$CURRENT_HOSTNAME}"
-
     hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
 
     if ! [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
@@ -650,11 +677,23 @@ fi
 # ---------------------------------------------------------------------------
 # Step 7: Docker installation
 #
-# Official Docker Debian repository.
+# Official Docker repository for Debian/Ubuntu.
 # ---------------------------------------------------------------------------
 
+# Re-read OS information in case the environment changed during installation.
 OS_ID="$(. /etc/os-release && echo "$ID")"
+OS_VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID")"
 OS_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+
+case "$OS_ID" in
+    debian|ubuntu)
+        ;;
+    *)
+        log_error "Unsupported operating system for Docker repository: $OS_ID"
+        exit 1
+        ;;
+esac
+
 DOCKER_ARCH="$(dpkg --print-architecture)"
 
 if ! step_done "docker"; then
@@ -673,14 +712,14 @@ if ! step_done "docker"; then
     install -m 0755 -d /etc/apt/keyrings
 
     curl -fsSL \
-        https://download.docker.com/linux/debian/gpg \
+        "https://download.docker.com/linux/$OS_ID/gpg" \
         -o /etc/apt/keyrings/docker.asc
 
     chmod a+r /etc/apt/keyrings/docker.asc
 
     cat > /etc/apt/sources.list.d/docker.sources <<EOF
 Types: deb
-URIs: https://download.docker.com/linux/debian
+URIs: https://download.docker.com/linux/$OS_ID
 Suites: $OS_CODENAME
 Components: stable
 Architectures: $DOCKER_ARCH
@@ -893,7 +932,6 @@ echo "Firewalld        : installed"
 echo "NextCloud-AIO    : $([[ "$install_nc" =~ ^y$ ]] && echo "installed" || echo "not installed")"
 echo "============================================================"
 echo
-
 echo "Access:"
 echo "Virtualmin/Webmin: https://$hostname:10000"
 echo "Portainer        : https://127.0.0.1:9443"
