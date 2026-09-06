@@ -69,6 +69,26 @@ case "$ARCH" in
 esac
 
 # ---------------------------------------------------------------------------
+# System Locales Configuration
+# ---------------------------------------------------------------------------
+if ! step_done "locale_fix"; then
+    log_step "Generating en_US.UTF-8 locale to prevent Perl warnings"
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y locales >/dev/null 2>&1 || true
+    sed -i 's/^[#[:space:]]*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    locale-gen en_US.UTF-8 >/dev/null 2>&1
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+    log_success "System locale generated and set to en_US.UTF-8."
+    mark_done "locale_fix"
+else
+    log_success "Locale already configured, skipping."
+fi
+
+# Export for the current running script to silence warnings immediately
+export LANG="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+
+# ---------------------------------------------------------------------------
 # Backup important configuration
 # ---------------------------------------------------------------------------
 if ! step_done "backup"; then
