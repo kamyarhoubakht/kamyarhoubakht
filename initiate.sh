@@ -1,959 +1,654 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euo pipefail
+# ============================================================
+# Nextcloud AIO installation behind a Virtualmin Apache domain
+#
+# Requirements:
+#   - Run as root
+#   - Virtualmin GPL installed
+#   - Docker installed
+#   - Apache installed
+#
+# Architecture:
+#   Internet
+#      |
+#   Virtualmin Apache :80/:443
+#      |
+#   Virtualmin native create-proxy
+#      |
+#   Nextcloud AIO Apache :11222 (127.0.0.1)
+#
+# AIO admin interface:
+#   http://SERVER:8080
+#
+# Nextcloud traffic:
+#   https://AIO_DOMAIN -> 127.0.0.1:11222
+# ============================================================
 
-[[ "${DEBUG:-}" == "true" ]] && set -x
+set -Eeuo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
+SCRIPT_NAME="install-nextcloud-aio.sh"
+LOG_DIR="/var/log"
+LOG_FILE="${LOG_DIR}/nextcloud-aio-install.log"
+STATE_FILE="/root/.nextcloud-aio-install.state"
 
-LOG_FILE="/var/log/setup_script.log"
-STATE_FILE="/root/.setup_state"
+AIO_COMPOSE_DIR="/root/nextcloud-aio"
+AIO_COMPOSE_FILE="${AIO_COMPOSE_DIR}/docker-compose.yaml"
+AIO_DATA_DIR="/mnt/ncdata"
 
-touch "$STATE_FILE"
-chmod 600 "$STATE_FILE"
+AIO_IMAGE="ghcr.io/nextcloud-releases/all-in-one:latest"
+AIO_WEB_PORT="11222"
+AIO_ADMIN_PORT="8080"
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Logging
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 
-log_step() {
-    echo "🔄 $1" | tee -a "$LOG_FILE"
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log() {
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-log_success() {
-    echo "✅ $1" | tee -a "$LOG_FILE"
+die() {
+    echo
+    echo "============================================================"
+    echo "ERROR"
+    echo "============================================================"
+    echo "$*"
+    echo
+    echo "Full log:"
+    echo "  $LOG_FILE"
+    echo
+    exit 1
 }
 
-log_error() {
-    echo "❌ $1" | tee -a "$LOG_FILE" >&2
+run_cmd() {
+    echo
+    echo "+ $*"
+    "$@"
 }
 
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-
-handle_error() {
+on_error() {
     local exit_code=$?
-    local line_number=$1
-
     echo
-    log_error "Error occurred at line $line_number. Exit code: $exit_code"
-    log_error "Full log: $LOG_FILE"
+    echo "============================================================"
+    echo "INSTALLATION FAILED"
+    echo "============================================================"
+    echo "Exit code: $exit_code"
+    echo "Line: ${BASH_LINENO[0]:-unknown}"
+    echo "Command: ${BASH_COMMAND:-unknown}"
     echo
-
+    echo "Log file:"
+    echo "  $LOG_FILE"
+    echo
     exit "$exit_code"
 }
 
-cleanup() {
-    :
-}
+trap on_error ERR
 
-trap 'handle_error $LINENO' ERR
-trap cleanup EXIT
+# ------------------------------------------------------------
+# Basic checks
+# ------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# State helpers
-# ---------------------------------------------------------------------------
+[[ "$EUID" -eq 0 ]] || die "This script must be run as root."
 
-step_done() {
-    grep -qxF "$1" "$STATE_FILE" 2>/dev/null
-}
+command -v docker >/dev/null 2>&1 \
+    || die "Docker was not found."
 
-mark_done() {
-    grep -qxF "$1" "$STATE_FILE" 2>/dev/null || \
-        echo "$1" >> "$STATE_FILE"
-}
+command -v virtualmin >/dev/null 2>&1 \
+    || die "Virtualmin command was not found."
 
-# ---------------------------------------------------------------------------
-# Root check
-# ---------------------------------------------------------------------------
+command -v apache2ctl >/dev/null 2>&1 \
+    || die "apache2ctl was not found."
 
-if [[ "$EUID" -ne 0 ]]; then
-    log_error "This script must be run as root."
-    exit 1
+command -v curl >/dev/null 2>&1 \
+    || die "curl was not found."
+
+command -v openssl >/dev/null 2>&1 \
+    || die "openssl was not found."
+
+log "Nextcloud AIO + Virtualmin installation started."
+
+# ------------------------------------------------------------
+# Detect Virtualmin / OS
+# ------------------------------------------------------------
+
+log "System information"
+
+echo "OS:"
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    echo "  ${PRETTY_NAME:-unknown}"
 fi
 
-# ---------------------------------------------------------------------------
-# Detect OS
-# ---------------------------------------------------------------------------
+echo "Architecture:"
+uname -m
 
-if [[ ! -f /etc/os-release ]]; then
-    log_error "Cannot determine operating system."
-    exit 1
+echo "Virtualmin:"
+virtualmin version || true
+
+echo "Apache:"
+apache2ctl -v | head -n 1 || true
+
+echo "Docker:"
+docker --version || true
+
+# ------------------------------------------------------------
+# Determine administrator username
+# ------------------------------------------------------------
+
+ADMIN_USER="${1:-}"
+
+if [[ -z "$ADMIN_USER" ]]; then
+    read -r -p "Virtualmin administrator username [root]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-root}"
 fi
 
-. /etc/os-release
+log "Virtualmin administrator: $ADMIN_USER"
 
-OS_ID="${ID:-}"
-OS_VERSION_ID="${VERSION_ID:-}"
-OS_CODENAME="${VERSION_CODENAME:-}"
+# ------------------------------------------------------------
+# Ask for domain
+# ------------------------------------------------------------
 
-log_step "Detected operating system: ${PRETTY_NAME:-unknown}"
+echo
+echo "============================================================"
+echo "Nextcloud AIO domain"
+echo "============================================================"
+echo
+echo "Enter the independent top-level domain/subdomain that will"
+echo "be used for Nextcloud."
+echo
+echo "Example:"
+echo "  cloud.example.com"
+echo
 
-case "$OS_ID" in
+read -r -p "Nextcloud domain: " AIO_DOMAIN
 
-    debian)
-        case "$OS_VERSION_ID" in
-            12|13)
-                log_success "Supported Debian version detected: $OS_VERSION_ID"
-                ;;
-            *)
-                log_error "Unsupported Debian version: $OS_VERSION_ID"
-                log_error "Supported Debian versions: 12, 13"
-                exit 1
-                ;;
-        esac
-        ;;
+AIO_DOMAIN="${AIO_DOMAIN,,}"
 
-    ubuntu)
-        case "$OS_VERSION_ID" in
-            22.04|24.04)
-                log_success "Supported Ubuntu version detected: $OS_VERSION_ID"
-                ;;
-            *)
-                log_error "Unsupported Ubuntu version: $OS_VERSION_ID"
-                log_error "Supported Ubuntu versions: 22.04, 24.04 LTS"
-                exit 1
-                ;;
-        esac
-        ;;
+[[ -n "$AIO_DOMAIN" ]] \
+    || die "No domain was supplied."
 
-    *)
-        log_error "Unsupported operating system."
-        log_error "This script supports Debian 12/13 and Ubuntu 22.04/24.04 LTS."
-        log_error "Detected: ${OS_ID:-unknown} ${OS_VERSION_ID:-unknown}"
-        exit 1
-        ;;
-
-esac
-
-# ---------------------------------------------------------------------------
-# Architecture check
-#
-# AMD64 and ARM64 are supported by Docker.
-#
-# IMPORTANT:
-# Virtualmin does not currently officially support ARM64.
-# ---------------------------------------------------------------------------
-
-ARCH="$(dpkg --print-architecture)"
-
-case "$ARCH" in
-
-    amd64)
-        log_success "Supported architecture detected: $ARCH"
-        ;;
-
-    arm64)
-        log_success "ARM64 architecture detected."
-        echo
-        log_error "IMPORTANT: Virtualmin does not currently officially support ARM64."
-        log_error "Docker, Portainer and Nextcloud AIO support ARM64, but Virtualmin"
-        log_error "may refuse to install or may not have ARM64 packages."
-        echo
-        ;;
-
-    *)
-        log_error "Unsupported architecture."
-        log_error "Supported architectures: amd64, arm64"
-        log_error "Detected architecture: $ARCH"
-        exit 1
-        ;;
-
-esac
-
-# ---------------------------------------------------------------------------
-# Backup important configuration
-# ---------------------------------------------------------------------------
-
-if ! step_done "backup"; then
-
-    log_step "Creating backup of important configuration files"
-
-    BACKUP_DIR="/root/pre_install_backup_$(date +%Y%m%d_%H%M%S)"
-
-    mkdir -p "$BACKUP_DIR"
-
-    for file in \
-        /etc/passwd \
-        /etc/shadow \
-        /etc/group \
-        /etc/gshadow \
-        /etc/sudoers \
-        /etc/sudoers.d \
-        /root/.ssh
-    do
-        if [[ -e "$file" ]]; then
-            cp -a "$file" "$BACKUP_DIR/"
-        else
-            echo "Skipping $file" | tee -a "$LOG_FILE"
-        fi
-    done
-
-    log_success "Backup created at $BACKUP_DIR"
-
-    mark_done "backup"
-
-else
-
-    log_success "Backup already done, skipping."
-
+if [[ ! "$AIO_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    die "Invalid domain name: $AIO_DOMAIN"
 fi
 
-# ---------------------------------------------------------------------------
-# Verify root SSH keys
-# ---------------------------------------------------------------------------
+log "Nextcloud domain: $AIO_DOMAIN"
 
-ROOT_AUTH_KEYS="/root/.ssh/authorized_keys"
+# ------------------------------------------------------------
+# State
+# ------------------------------------------------------------
 
-if [[ ! -s "$ROOT_AUTH_KEYS" ]]; then
-    log_error "No /root/.ssh/authorized_keys found."
-    log_error "Install your SSH key for root first, then run this script again."
-
-    exit 1
-fi
-
-log_success "Root SSH authorized_keys found."
-
-# ---------------------------------------------------------------------------
-# Step 1: Create administrator user
-# ---------------------------------------------------------------------------
-
-if ! step_done "admin_user"; then
-
-    read -rp "Enter administrator username (default: goodmin): " sudo_user
-
-    sudo_user="${sudo_user:-goodmin}"
-
-    if ! [[ "$sudo_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        log_error "Invalid username: $sudo_user"
-        exit 1
-    fi
-
-    if [[ "$sudo_user" == "root" ]]; then
-        log_error "The administrator username cannot be root."
-        exit 1
-    fi
-
-    echo "$sudo_user" > /root/.virtualmin_admin_user
-    chmod 600 /root/.virtualmin_admin_user
-
-    if id -u "$sudo_user" &>/dev/null; then
-
-        log_success "User '$sudo_user' already exists."
-
-    else
-
-        log_step "Creating administrator user '$sudo_user'"
-
-        useradd \
-            --create-home \
-            --shell /bin/bash \
-            "$sudo_user"
-
-        log_success "User '$sudo_user' created."
-
-    fi
-
-    echo
-    echo "============================================================"
-    echo " Administrator password"
-    echo "============================================================"
-    echo
-    echo "Create a password for '$sudo_user'."
-    echo
-    echo "This password is separate from SSH authentication."
-    echo "SSH will use your SSH key."
-    echo
-
-    while true; do
-
-        read -rsp "Password: " sudo_user_password
-        echo
-
-        if [[ ${#sudo_user_password} -lt 12 ]]; then
-            echo "Password must contain at least 12 characters."
-            continue
-        fi
-
-        read -rsp "Confirm password: " sudo_user_password_confirm
-        echo
-
-        if [[ "$sudo_user_password" != "$sudo_user_password_confirm" ]]; then
-            echo "Passwords do not match. Please try again."
-            continue
-        fi
-
-        break
-
-    done
-
-    printf '%s:%s\n' "$sudo_user" "$sudo_user_password" | chpasswd
-
-    unset sudo_user_password
-    unset sudo_user_password_confirm
-
-    log_success "Password created for '$sudo_user'."
-
-    # -----------------------------------------------------------------------
-    # Passwordless sudo
-    # -----------------------------------------------------------------------
-
-    log_step "Configuring passwordless sudo for '$sudo_user'"
-
-    cat > "/etc/sudoers.d/$sudo_user" <<EOF
-$sudo_user ALL=(ALL:ALL) NOPASSWD:ALL
+cat > "$STATE_FILE" <<EOF
+AIO_DOMAIN='$AIO_DOMAIN'
+AIO_WEB_PORT='$AIO_WEB_PORT'
+AIO_ADMIN_PORT='$AIO_ADMIN_PORT'
+AIO_DATA_DIR='$AIO_DATA_DIR'
+AIO_COMPOSE_FILE='$AIO_COMPOSE_FILE'
 EOF
 
-    chmod 0440 "/etc/sudoers.d/$sudo_user"
+# ------------------------------------------------------------
+# Check whether domain already exists
+# ------------------------------------------------------------
 
-    if ! visudo -cf "/etc/sudoers.d/$sudo_user" >/dev/null; then
+log "Checking Virtualmin domain"
 
-        log_error "Invalid sudoers configuration."
+if virtualmin list-domains --name-only 2>/dev/null \
+    | grep -Fxq "$AIO_DOMAIN"; then
 
-        rm -f "/etc/sudoers.d/$sudo_user"
+    log "Virtualmin domain already exists: $AIO_DOMAIN"
 
-        exit 1
+else
 
+    log "Creating Virtualmin domain: $AIO_DOMAIN"
+
+    virtualmin create-domain \
+        --domain "$AIO_DOMAIN" \
+        --unix \
+        --dir \
+        --web \
+        --ssl \
+        --skip-warnings \
+        || die "Virtualmin failed to create $AIO_DOMAIN."
+
+fi
+
+# ------------------------------------------------------------
+# Apache modules
+# ------------------------------------------------------------
+
+log "Enabling required Apache modules"
+
+REQUIRED_MODULES=(
+    proxy
+    proxy_http
+    proxy_wstunnel
+    rewrite
+    headers
+    ssl
+    http2
+)
+
+for module in "${REQUIRED_MODULES[@]}"; do
+    if command -v a2enmod >/dev/null 2>&1; then
+        run_cmd a2enmod "$module" || true
     fi
+done
 
-    # -----------------------------------------------------------------------
-    # Copy SSH authorized keys
-    # -----------------------------------------------------------------------
+# ------------------------------------------------------------
+# Create AIO data directory
+# ------------------------------------------------------------
 
-    log_step "Installing SSH keys for '$sudo_user'"
+log "Creating Nextcloud AIO data directory"
 
-    USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
-    USER_GROUP="$(id -gn "$sudo_user")"
+mkdir -p "$AIO_DATA_DIR"
 
-    mkdir -p "$USER_HOME/.ssh"
+chmod 755 "$AIO_DATA_DIR"
 
-    cp "$ROOT_AUTH_KEYS" "$USER_HOME/.ssh/authorized_keys"
+# ------------------------------------------------------------
+# Create compose directory
+# ------------------------------------------------------------
 
-    chown -R "$sudo_user:$USER_GROUP" "$USER_HOME/.ssh"
+mkdir -p "$AIO_COMPOSE_DIR"
 
-    chmod 700 "$USER_HOME/.ssh"
-    chmod 600 "$USER_HOME/.ssh/authorized_keys"
+# ------------------------------------------------------------
+# Docker Compose
+# ------------------------------------------------------------
 
-    log_success "SSH keys copied to '$sudo_user'."
+log "Writing Nextcloud AIO Docker Compose configuration"
 
-    mark_done "admin_user"
-
-else
-
-    log_success "Administrator user already configured, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Recover administrator username when re-running
-# ---------------------------------------------------------------------------
-
-if [[ -z "${sudo_user:-}" ]]; then
-
-    if [[ -f /root/.virtualmin_admin_user ]]; then
-
-        sudo_user="$(cat /root/.virtualmin_admin_user)"
-
-    else
-
-        read -rp "Enter administrator username (default: goodmin): " sudo_user
-
-        sudo_user="${sudo_user:-goodmin}"
-
-    fi
-
-fi
-
-if ! id -u "$sudo_user" &>/dev/null; then
-
-    log_error "Administrator user '$sudo_user' does not exist."
-
-    exit 1
-
-fi
-
-USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
-USER_GROUP="$(id -gn "$sudo_user")"
-
-# ---------------------------------------------------------------------------
-# Step 1b: SSH hardening
-# ---------------------------------------------------------------------------
-
-if ! step_done "ssh_hardening"; then
-
-    log_step "Configuring SSH for key-based authentication"
-
-    SSH_CONFIG="/etc/ssh/sshd_config"
-
-    cp -a "$SSH_CONFIG" "${SSH_CONFIG}.pre-virtualmin-$(date +%Y%m%d_%H%M%S)"
-
-    sed -i \
-        -e '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' \
-        -e '/^[[:space:]]*KbdInteractiveAuthentication[[:space:]]/d' \
-        -e '/^[[:space:]]*ChallengeResponseAuthentication[[:space:]]/d' \
-        -e '/^[[:space:]]*PermitRootLogin[[:space:]]/d' \
-        "$SSH_CONFIG"
-
-    cat >> "$SSH_CONFIG" <<'EOF'
-# Managed by initiate.sh
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-PermitRootLogin prohibit-password
-EOF
-
-    sshd -t
-
-    systemctl restart ssh
-
-    log_success "SSH configured for key-based authentication."
-
-    mark_done "ssh_hardening"
-
-else
-
-    log_success "SSH hardening already completed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 2: Minimal system preparation
-# ---------------------------------------------------------------------------
-
-if ! step_done "system_prepare"; then
-
-    log_step "Updating package lists"
-
-    apt-get update
-
-    log_step "Installing required bootstrap packages"
-
-    apt-get install -y \
-        ca-certificates \
-        curl \
-        gnupg \
-        btop \
-        tmux \
-        wget \
-        lsb-release \
-        openssl
-
-    log_success "System preparation complete."
-
-    mark_done "system_prepare"
-
-else
-
-    log_success "System preparation already completed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 3: Debian 13 cloud-init handling
-# ---------------------------------------------------------------------------
-
-if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
-
-    if ! step_done "debian13_cloudinit"; then
-
-        if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null \
-            | grep -q "install ok installed"; then
-
-            log_step "Debian 13 detected: disabling cloud-init"
-
-            systemctl stop \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            systemctl disable \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            systemctl mask \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            log_step "Removing cloud-init"
-
-            apt-get purge -y cloud-init
-            apt-get autoremove -y
-
-            rm -rf \
-                /etc/cloud \
-                /var/lib/cloud
-
-            systemctl daemon-reload
-
-            log_success "cloud-init removed from Debian 13."
-
-        else
-
-            log_success "cloud-init is not installed on Debian 13."
-
-        fi
-
-        mark_done "debian13_cloudinit"
-
-    else
-
-        log_success "Debian 13 cloud-init handling already completed, skipping."
-
-    fi
-
-else
-
-    log_success "Not Debian 13 — cloud-init left untouched."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 4: Select Virtualmin stack
-# ---------------------------------------------------------------------------
-
-if ! step_done "stack_selected"; then
-
-    while true; do
-
-        read -rp \
-            "Install LAMP (Apache) or LEMP (Nginx)? (LAMP/LEMP): " \
-            stack_choice
-
-        stack_choice="$(echo "$stack_choice" | tr '[:lower:]' '[:upper:]')"
-
-        if [[ "$stack_choice" == "LAMP" ||
-              "$stack_choice" == "LEMP" ]]; then
-            break
-        fi
-
-        echo "Please enter LAMP or LEMP."
-
-    done
-
-    echo "$stack_choice" > /root/.virtualmin_stack
-
-    log_success "Selected Virtualmin stack: $stack_choice"
-
-    mark_done "stack_selected"
-
-else
-
-    stack_choice="$(cat /root/.virtualmin_stack)"
-
-    log_success "Using previously selected stack: $stack_choice"
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 5: Hostname
-# ---------------------------------------------------------------------------
-
-if ! step_done "hostname"; then
-
-    CURRENT_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
-
-    echo
-    echo "Virtualmin requires a proper fully qualified hostname."
-    echo "Example: server.example.com"
-    echo
-
-    read -rp "Enter hostname [$CURRENT_HOSTNAME]: " hostname
-
-    hostname="${hostname:-$CURRENT_HOSTNAME}"
-    hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
-
-    if ! [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
-
-        log_error "Invalid hostname: $hostname"
-        log_error "Use a fully qualified hostname such as server.example.com"
-
-        exit 1
-
-    fi
-
-    hostnamectl set-hostname "$hostname"
-
-    echo "$hostname" > /root/.virtualmin_hostname
-
-    log_success "Hostname set to $hostname"
-
-    mark_done "hostname"
-
-else
-
-    hostname="$(cat /root/.virtualmin_hostname)"
-
-    log_success "Using existing hostname: $hostname"
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 6: Virtualmin installation
-# ---------------------------------------------------------------------------
-
-if ! step_done "virtualmin"; then
-
-    if [[ "$ARCH" == "arm64" ]]; then
-        echo
-        log_error "IMPORTANT: This is an ARM64 system."
-        log_error "Virtualmin's current installer does not officially support ARM64."
-        log_error "The Virtualmin installation may fail at this point."
-        echo
-    fi
-
-    log_step "Installing current Virtualmin using official installer"
-
-    export VIRTUALMIN_NONINTERACTIVE=1
-
-    sh -c "$(curl -fsSL https://download.virtualmin.com/virtualmin-install)" \
-        -- \
-        --bundle "$stack_choice" \
-        --hostname "$hostname"
-
-    log_success "Virtualmin installed successfully."
-
-    mark_done "virtualmin"
-
-else
-
-    log_success "Virtualmin already installed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 6b: Ensure Firewalld and Fail2ban are fully installed
-# ---------------------------------------------------------------------------
-
-if ! step_done "security_services"; then
-
-    log_step "Ensuring Firewalld and Fail2ban are installed"
-
-    apt-get update
-
-    apt-get install -y \
-        firewalld \
-        fail2ban
-
-    systemctl enable --now firewalld
-    systemctl enable --now fail2ban
-
-    if ! systemctl is-active --quiet firewalld; then
-        log_error "Firewalld is not running."
-        exit 1
-    fi
-
-    if ! systemctl is-active --quiet fail2ban; then
-        log_error "Fail2ban is not running."
-        exit 1
-    fi
-
-    log_success "Firewalld installed and running."
-    log_success "Fail2ban installed and running."
-
-    mark_done "security_services"
-
-else
-
-    log_success "Firewalld and Fail2ban already configured, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 7: Docker installation
-#
-# Official Docker repository for Debian/Ubuntu.
-# ---------------------------------------------------------------------------
-
-OS_ID="$(. /etc/os-release && echo "$ID")"
-OS_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-DOCKER_ARCH="$(dpkg --print-architecture)"
-
-case "$OS_ID" in
-    debian|ubuntu)
-        ;;
-    *)
-        log_error "Unsupported operating system for Docker repository: $OS_ID"
-        exit 1
-        ;;
-esac
-
-case "$DOCKER_ARCH" in
-    amd64|arm64)
-        ;;
-    *)
-        log_error "Unsupported Docker architecture: $DOCKER_ARCH"
-        exit 1
-        ;;
-esac
-
-if ! step_done "docker"; then
-
-    log_step "Installing Docker from the official Docker repository"
-
-    apt-get remove -y \
-        docker.io \
-        docker-compose \
-        docker-doc \
-        podman-docker \
-        containerd \
-        runc \
-        2>/dev/null || true
-
-    install -m 0755 -d /etc/apt/keyrings
-
-    curl -fsSL \
-        "https://download.docker.com/linux/$OS_ID/gpg" \
-        -o /etc/apt/keyrings/docker.asc
-
-    chmod a+r /etc/apt/keyrings/docker.asc
-
-    cat > /etc/apt/sources.list.d/docker.sources <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/$OS_ID
-Suites: $OS_CODENAME
-Components: stable
-Architectures: $DOCKER_ARCH
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-
-    apt-get update
-
-    apt-get install -y \
-        docker-ce \
-        docker-ce-cli \
-        containerd.io \
-        docker-buildx-plugin \
-        docker-compose-plugin
-
-    systemctl enable --now docker
-
-    if ! systemctl is-active --quiet docker; then
-        log_error "Docker service is not running."
-        exit 1
-    fi
-
-    log_success "Docker installed and running."
-
-    mark_done "docker"
-
-else
-
-    log_success "Docker already installed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Add administrator to Docker group
-# ---------------------------------------------------------------------------
-
-usermod -aG docker "$sudo_user"
-
-log_success "User '$sudo_user' added to the Docker group."
-
-# ---------------------------------------------------------------------------
-# Step 8: Portainer
-# ---------------------------------------------------------------------------
-
-if ! step_done "portainer"; then
-
-    log_step "Installing Portainer"
-
-    docker volume inspect portainer_data >/dev/null 2>&1 || \
-        docker volume create portainer_data >/dev/null
-
-    PORTAINER_DIR="$USER_HOME/portainer"
-
-    mkdir -p "$PORTAINER_DIR"
-
-    cat > "$PORTAINER_DIR/docker-compose.yaml" <<'EOF'
-name: portainer
-
+cat > "$AIO_COMPOSE_FILE" <<EOF
 services:
-
-  portainer-ce:
-    image: portainer/portainer-ce:lts
-    container_name: portainer
-    restart: unless-stopped
+  nextcloud-aio-mastercontainer:
+    image: ${AIO_IMAGE}
+    container_name: nextcloud-aio-mastercontainer
+    restart: always
 
     ports:
-      - "127.0.0.1:8000:8000"
-      - "127.0.0.1:9443:9443"
+      - "${AIO_ADMIN_PORT}:8080"
+      - "127.0.0.1:${AIO_WEB_PORT}:11222"
 
     volumes:
+      - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - portainer_data:/data
+      - ${AIO_DATA_DIR}:/mnt/ncdata
+
+    environment:
+      APACHE_PORT: 11222
+      APACHE_IP_BINDING: 127.0.0.1
+
+      SKIP_DOMAIN_VALIDATION: true
+
+      NEXTCLOUD_DATADIR: /mnt/ncdata
+      NEXTCLOUD_MOUNT: /mnt/
+
+      NEXTCLOUD_STARTUP_APPS: twofactor_totp calendar contacts files_external
+
+      NEXTCLOUD_ENABLE_DRI_DEVICE: false
 
 volumes:
-
-  portainer_data:
-    external: true
-    name: portainer_data
+  nextcloud_aio_mastercontainer:
+    name: nextcloud_aio_mastercontainer
 EOF
 
-    chown -R "$sudo_user:$USER_GROUP" "$PORTAINER_DIR"
+# ------------------------------------------------------------
+# Validate compose
+# ------------------------------------------------------------
 
-    (
-        cd "$PORTAINER_DIR"
-        docker compose up -d
-    )
+log "Validating Docker Compose configuration"
 
-    if ! docker ps --format '{{.Names}}' | grep -qx "portainer"; then
+if docker compose version >/dev/null 2>&1; then
 
-        log_error "Portainer container failed to start."
+    run_cmd docker compose \
+        -f "$AIO_COMPOSE_FILE" \
+        config >/dev/null
 
-        exit 1
+else
+    die "Docker Compose plugin is not available."
+fi
 
+# ------------------------------------------------------------
+# Start AIO
+# ------------------------------------------------------------
+
+log "Starting Nextcloud AIO"
+
+run_cmd docker compose \
+    -f "$AIO_COMPOSE_FILE" \
+    up -d
+
+# ------------------------------------------------------------
+# Wait for AIO administration interface
+# ------------------------------------------------------------
+
+log "Waiting for Nextcloud AIO administration interface on port ${AIO_ADMIN_PORT}"
+
+AIO_READY=0
+
+for i in $(seq 1 60); do
+
+    if curl \
+        --silent \
+        --show-error \
+        --max-time 3 \
+        "http://127.0.0.1:${AIO_ADMIN_PORT}/" \
+        >/dev/null 2>&1; then
+
+        AIO_READY=1
+        break
     fi
 
-    log_success "Portainer started successfully."
+    printf "."
 
-    mark_done "portainer"
+    sleep 2
 
-else
-
-    log_success "Portainer already installed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 9: Optional Nextcloud AIO
-# ---------------------------------------------------------------------------
-
-install_nc="n"
-
-if [[ -f /root/.nextcloud_choice ]]; then
-
-    install_nc="$(cat /root/.nextcloud_choice)"
-
-else
-
-    read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
-
-    install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
-
-    echo "$install_nc" > /root/.nextcloud_choice
-
-fi
-
-if [[ "$install_nc" =~ ^y$ ]]; then
-
-    if [[ ! -x /root/install-nextcloud-aio.sh ]]; then
-
-        log_step "Downloading Nextcloud AIO installation script"
-
-        curl -fsSL \
-            "https://raw.githubusercontent.com/kamyarhoubakht/kamyarhoubakht/refs/heads/main/install-nextcloud-aio.sh" \
-            -o /root/install-nextcloud-aio.sh
-
-        chmod 700 /root/install-nextcloud-aio.sh
-
-        log_success "Nextcloud AIO installer downloaded."
-
-    fi
-
-    log_step "Starting Nextcloud AIO installation"
-
-    /root/install-nextcloud-aio.sh "$sudo_user"
-
-    log_success "Nextcloud AIO installation script completed."
-
-else
-
-    log_success "NextCloud-AIO not selected."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-
-log_step "Cleaning package cache"
-
-apt-get autoremove -y
-apt-get clean
-
-# ---------------------------------------------------------------------------
-# Final verification
-# ---------------------------------------------------------------------------
-
-log_step "Running final verification"
-
-if systemctl is-active --quiet docker; then
-    log_success "Docker: running"
-else
-    log_error "Docker: NOT running"
-fi
-
-if systemctl is-active --quiet fail2ban; then
-    log_success "Fail2ban: running"
-else
-    log_error "Fail2ban: NOT running"
-fi
-
-if systemctl is-active --quiet firewalld; then
-    log_success "Firewalld: running"
-else
-    log_error "Firewalld: NOT running"
-fi
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
-log_step "Installation complete!"
+done
 
 echo
-echo "============================================================"
-echo " Installation Summary"
-echo "============================================================"
-echo "Operating System : ${PRETTY_NAME:-unknown}"
-echo "Architecture     : $ARCH"
-echo "Hostname         : $hostname"
-echo "Virtualmin stack : $stack_choice"
-echo "Administrator    : $sudo_user"
-echo "SSH authentication: SSH key only"
-echo "Sudo             : NOPASSWD"
-echo "Docker           : installed"
-echo "Portainer        : installed"
-echo "Fail2ban         : installed"
-echo "Firewalld        : installed"
-echo "NextCloud-AIO    : $([[ "$install_nc" =~ ^y$ ]] && echo "installed" || echo "not installed")"
-echo "============================================================"
-echo
-echo "Access:"
-echo "Virtualmin/Webmin: https://$hostname:10000"
-echo "Portainer        : https://127.0.0.1:9443"
 
-if [[ "$install_nc" =~ ^y$ ]]; then
+[[ "$AIO_READY" -eq 1 ]] \
+    || die "Nextcloud AIO did not become available on port ${AIO_ADMIN_PORT}."
+
+log "Nextcloud AIO administration interface is available."
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Test the ACTUAL installed Virtualmin API.
+#
+# Do not use:
+#   virtualmin help modify-web | grep ...
+#
+# The help output is not a reliable capability test across
+# Virtualmin versions.
+#
+# We use a harmless directive and immediately remove it.
+# ------------------------------------------------------------
+
+log "Testing Virtualmin native --add-directive API"
+
+TEST_DIRECTIVE="LimitRequestBody 0"
+TEST_OUTPUT="$(mktemp)"
+
+set +e
+
+virtualmin modify-web \
+    --domain "$AIO_DOMAIN" \
+    --add-directive "$TEST_DIRECTIVE" \
+    >"$TEST_OUTPUT" 2>&1
+
+TEST_EXIT_CODE=$?
+
+set -e
+
+cat "$TEST_OUTPUT"
+
+if [[ "$TEST_EXIT_CODE" -ne 0 ]]; then
+
+    rm -f "$TEST_OUTPUT"
+
+    die "The installed Virtualmin does not accept --add-directive.
+
+The current Virtualmin GPL source supports this API, but this
+installation appears to be using an older/different version.
+
+The test command was:
+
+  virtualmin modify-web --domain $AIO_DOMAIN --add-directive \"LimitRequestBody 0\"
+
+Update Virtualmin and run this script again."
+
+fi
+
+rm -f "$TEST_OUTPUT"
+
+log "Virtualmin --add-directive API is available."
+
+# ------------------------------------------------------------
+# Remove test directive
+# ------------------------------------------------------------
+
+log "Removing temporary API test directive"
+
+virtualmin modify-web \
+    --domain "$AIO_DOMAIN" \
+    --remove-directive "$TEST_DIRECTIVE" \
+    || die "Could not remove the temporary API test directive."
+
+# ------------------------------------------------------------
+# Configure Virtualmin native reverse proxy
+# ------------------------------------------------------------
+
+log "Creating Virtualmin native reverse proxy"
+
+# Remove an existing proxy first if the installation was previously
+# interrupted. Ignore failure because no proxy may exist.
+
+set +e
+virtualmin delete-proxy \
+    --domain "$AIO_DOMAIN" \
+    --path "/" \
+    >/tmp/nextcloud-aio-delete-proxy.log 2>&1
+DELETE_PROXY_EXIT=$?
+set -e
+
+if [[ "$DELETE_PROXY_EXIT" -ne 0 ]]; then
+    echo "No existing proxy was removed (normal for a new installation)."
+fi
+
+# ------------------------------------------------------------
+# create-proxy
+#
+# --websockets is supported by the current Virtualmin GPL source.
+#
+# It creates the native ProxyPass / ProxyPassReverse configuration
+# and websocket handling without reconstructing the VirtualHost.
+# ------------------------------------------------------------
+
+log "Adding native proxy for / -> http://127.0.0.1:${AIO_WEB_PORT}/"
+
+PROXY_OUTPUT="$(mktemp)"
+
+set +e
+
+virtualmin create-proxy \
+    --domain "$AIO_DOMAIN" \
+    --path "/" \
+    --url "http://127.0.0.1:${AIO_WEB_PORT}/" \
+    --websockets \
+    >"$PROXY_OUTPUT" 2>&1
+
+PROXY_EXIT_CODE=$?
+
+set -e
+
+cat "$PROXY_OUTPUT"
+
+if [[ "$PROXY_EXIT_CODE" -ne 0 ]]; then
+    rm -f "$PROXY_OUTPUT"
+    die "Virtualmin create-proxy failed."
+fi
+
+rm -f "$PROXY_OUTPUT"
+
+# ------------------------------------------------------------
+# Preserve original Host header
+# ------------------------------------------------------------
+
+log "Configuring Virtualmin proxy-host handling"
+
+virtualmin modify-web \
+    --domain "$AIO_DOMAIN" \
+    --proxy-host \
+    || die "Virtualmin --proxy-host configuration failed."
+
+# ------------------------------------------------------------
+# Native HTTP protocol configuration
+#
+# --protocols is preferable to --add-directive here because
+# Protocols has multiple values and modify-web supports it
+# natively.
+# ------------------------------------------------------------
+
+log "Configuring HTTP/2 / HTTP/1.1 protocols"
+
+virtualmin modify-web \
+    --domain "$AIO_DOMAIN" \
+    --protocols "http/1.1 h2" \
+    || die "Virtualmin protocol configuration failed."
+
+# ------------------------------------------------------------
+# Nextcloud AIO / Apache directives
+#
+# IMPORTANT:
+# Virtualmin's current --add-directive parser accepts:
+#
+#     DIRECTIVE VALUE
+#
+# where VALUE is one whitespace-separated token.
+#
+# Therefore we deliberately only add directives whose values
+# consist of a single token.
+#
+# X-Forwarded-Proto is already handled by Virtualmin's native
+# proxy implementation.
+#
+# X-Real-IP is NOT added here because:
+#
+#     RequestHeader set X-Real-IP %{REMOTE_ADDR}s
+#
+# cannot safely be passed through the current --add-directive
+# parser.
+# ------------------------------------------------------------
+
+log "Adding Nextcloud AIO Apache directives"
+
+NATIVE_DIRECTIVES=(
+    "AllowEncodedSlashes NoDecode"
+    "H2WindowSize 5242880"
+    "TraceEnable off"
+    "LimitRequestBody 0"
+    "Timeout 3610"
+    "ProxyTimeout 3610"
+)
+
+for directive in "${NATIVE_DIRECTIVES[@]}"; do
+
+    log "Adding directive: $directive"
+
+    virtualmin modify-web \
+        --domain "$AIO_DOMAIN" \
+        --add-directive "$directive" \
+        || die "Failed to add Apache directive: $directive"
+
+done
+
+# ------------------------------------------------------------
+# Apache configuration validation
+# ------------------------------------------------------------
+
+log "Validating Apache configuration"
+
+if ! apache2ctl configtest; then
 
     echo
-    echo "NextCloud AIO:"
-    echo "AIO setup interface: http://SERVER-IP:8080"
+    echo "Apache configuration is INVALID."
     echo
-    echo "Complete the AIO setup before configuring the Apache"
-    echo "reverse proxy to port 11222."
+    echo "The Virtualmin changes have been made, but Apache"
+    echo "must not be reloaded until the configuration is fixed."
+    echo
+    echo "Inspect:"
+    echo "  $LOG_FILE"
+    echo
+
+    die "Apache configtest failed."
 
 fi
 
+log "Apache configuration is valid."
+
+# ------------------------------------------------------------
+# Reload Apache
+# ------------------------------------------------------------
+
+log "Reloading Apache"
+
+if command -v systemctl >/dev/null 2>&1; then
+    run_cmd systemctl reload apache2
+else
+    run_cmd service apache2 reload
+fi
+
+# ------------------------------------------------------------
+# Verify ports
+# ------------------------------------------------------------
+
+log "Checking AIO ports"
+
 echo
-echo "SSH:"
-echo "  Password authentication: disabled"
-echo "  Root login: SSH key only"
-echo "  Administrator login: SSH key"
+ss -lntp 2>/dev/null | grep -E ":(${AIO_ADMIN_PORT}|${AIO_WEB_PORT})\b" || true
+
+# ------------------------------------------------------------
+# Verify Docker containers
+# ------------------------------------------------------------
+
+log "Checking Nextcloud AIO containers"
+
+docker ps \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
+    | grep -E 'nextcloud-aio|NAMES' \
+    || true
+
+# ------------------------------------------------------------
+# Final information
+# ------------------------------------------------------------
+
 echo
-echo "Setup log:"
-echo "  $LOG_FILE"
+echo "============================================================"
+echo "NEXTCLOUD AIO INSTALLATION COMPLETE"
+echo "============================================================"
+echo
+echo "Nextcloud domain:"
+echo "  https://${AIO_DOMAIN}"
+echo
+echo "AIO administration interface:"
+echo "  http://SERVER-IP:${AIO_ADMIN_PORT}"
+echo
+echo "AIO internal Apache:"
+echo "  127.0.0.1:${AIO_WEB_PORT}"
+echo
+echo "Data directory:"
+echo "  ${AIO_DATA_DIR}"
+echo
+echo "Docker Compose:"
+echo "  ${AIO_COMPOSE_FILE}"
+echo
+echo "Installation log:"
+echo "  ${LOG_FILE}"
 echo
 echo "State file:"
-echo "  $STATE_FILE"
+echo "  ${STATE_FILE}"
 echo
-echo "Installation completed successfully."
+echo "============================================================"
+echo
+echo "IMPORTANT:"
+echo
+echo "1. Point DNS for ${AIO_DOMAIN} to this server."
+echo
+echo "2. Open:"
+echo "     https://${AIO_DOMAIN}"
+echo
+echo "3. The AIO administration interface remains available at:"
+echo "     http://SERVER-IP:${AIO_ADMIN_PORT}"
+echo
+echo "4. Complete the Nextcloud AIO setup from that interface."
+echo
+echo "5. The reverse proxy is managed by Virtualmin's native"
+echo "   create-proxy / modify-web APIs."
+echo
+echo "============================================================"
+
