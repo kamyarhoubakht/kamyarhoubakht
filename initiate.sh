@@ -121,42 +121,24 @@ case "$OS_ID" in
         log_error "Detected: ${OS_ID:-unknown} ${OS_VERSION_ID:-unknown}"
         exit 1
         ;;
-
 esac
 
 # ---------------------------------------------------------------------------
 # Architecture check
-#
-# AMD64 and ARM64 are supported by Docker.
-#
-# IMPORTANT:
-# Virtualmin does not currently officially support ARM64.
 # ---------------------------------------------------------------------------
 
 ARCH="$(dpkg --print-architecture)"
 
 case "$ARCH" in
-
-    amd64)
+    amd64|arm64)
         log_success "Supported architecture detected: $ARCH"
         ;;
-
-    arm64)
-        log_success "ARM64 architecture detected."
-        echo
-        log_error "IMPORTANT: Virtualmin does not currently officially support ARM64."
-        log_error "Docker, Portainer and Nextcloud AIO support ARM64, but Virtualmin"
-        log_error "may refuse to install or may not have ARM64 packages."
-        echo
-        ;;
-
     *)
         log_error "Unsupported architecture."
         log_error "Supported architectures: amd64, arm64"
         log_error "Detected architecture: $ARCH"
         exit 1
         ;;
-
 esac
 
 # ---------------------------------------------------------------------------
@@ -206,7 +188,6 @@ ROOT_AUTH_KEYS="/root/.ssh/authorized_keys"
 if [[ ! -s "$ROOT_AUTH_KEYS" ]]; then
     log_error "No /root/.ssh/authorized_keys found."
     log_error "Install your SSH key for root first, then run this script again."
-
     exit 1
 fi
 
@@ -219,7 +200,6 @@ log_success "Root SSH authorized_keys found."
 if ! step_done "admin_user"; then
 
     read -rp "Enter administrator username (default: goodmin): " sudo_user
-
     sudo_user="${sudo_user:-goodmin}"
 
     if ! [[ "$sudo_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
@@ -236,11 +216,8 @@ if ! step_done "admin_user"; then
     chmod 600 /root/.virtualmin_admin_user
 
     if id -u "$sudo_user" &>/dev/null; then
-
         log_success "User '$sudo_user' already exists."
-
     else
-
         log_step "Creating administrator user '$sudo_user'"
 
         useradd \
@@ -249,7 +226,6 @@ if ! step_done "admin_user"; then
             "$sudo_user"
 
         log_success "User '$sudo_user' created."
-
     fi
 
     echo
@@ -257,6 +233,7 @@ if ! step_done "admin_user"; then
     echo " Administrator password"
     echo "============================================================"
     echo
+
     echo "Create a password for '$sudo_user'."
     echo
     echo "This password is separate from SSH authentication."
@@ -305,11 +282,8 @@ EOF
     chmod 0440 "/etc/sudoers.d/$sudo_user"
 
     if ! visudo -cf "/etc/sudoers.d/$sudo_user" >/dev/null; then
-
         log_error "Invalid sudoers configuration."
-
         rm -f "/etc/sudoers.d/$sudo_user"
-
         exit 1
     fi
 
@@ -348,25 +322,17 @@ fi
 if [[ -z "${sudo_user:-}" ]]; then
 
     if [[ -f /root/.virtualmin_admin_user ]]; then
-
         sudo_user="$(cat /root/.virtualmin_admin_user)"
-
     else
-
         read -rp "Enter administrator username (default: goodmin): " sudo_user
-
         sudo_user="${sudo_user:-goodmin}"
-
     fi
 
 fi
 
 if ! id -u "$sudo_user" &>/dev/null; then
-
     log_error "Administrator user '$sudo_user' does not exist."
-
     exit 1
-
 fi
 
 USER_HOME="$(getent passwd "$sudo_user" | cut -d: -f6)"
@@ -414,106 +380,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2: Minimal system preparation
-# ---------------------------------------------------------------------------
-
-if ! step_done "system_prepare"; then
-
-    log_step "Updating package lists"
-
-    apt-get update
-
-    log_step "Installing required bootstrap packages"
-
-    apt-get install -y \
-        ca-certificates \
-        curl \
-        gnupg \
-        btop \
-        tmux \
-        wget \
-        lsb-release \
-        openssl
-
-    log_success "System preparation complete."
-
-    mark_done "system_prepare"
-
-else
-
-    log_success "System preparation already completed, skipping."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 3: Debian 13 cloud-init handling
-# ---------------------------------------------------------------------------
-
-if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "13" ]]; then
-
-    if ! step_done "debian13_cloudinit"; then
-
-        if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null \
-            | grep -q "install ok installed"; then
-
-            log_step "Debian 13 detected: disabling cloud-init"
-
-            systemctl stop \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            systemctl disable \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            systemctl mask \
-                cloud-init.service \
-                cloud-init-local.service \
-                cloud-config.service \
-                cloud-final.service \
-                2>/dev/null || true
-
-            log_step "Removing cloud-init"
-
-            apt-get purge -y cloud-init
-            apt-get autoremove -y
-
-            rm -rf \
-                /etc/cloud \
-                /var/lib/cloud
-
-            systemctl daemon-reload
-
-            log_success "cloud-init removed from Debian 13."
-
-        else
-
-            log_success "cloud-init is not installed on Debian 13."
-
-        fi
-
-        mark_done "debian13_cloudinit"
-
-    else
-
-        log_success "Debian 13 cloud-init handling already completed, skipping."
-
-    fi
-
-else
-
-    log_success "Not Debian 13 — cloud-init left untouched."
-
-fi
-
-# ---------------------------------------------------------------------------
-# Step 4: Select Virtualmin stack
+# Step 2: Select Virtualmin stack
 # ---------------------------------------------------------------------------
 
 if ! step_done "stack_selected"; then
@@ -550,7 +417,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: Hostname
+# Step 3: Hostname
 # ---------------------------------------------------------------------------
 
 if ! step_done "hostname"; then
@@ -568,12 +435,9 @@ if ! step_done "hostname"; then
     hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
 
     if ! [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
-
         log_error "Invalid hostname: $hostname"
         log_error "Use a fully qualified hostname such as server.example.com"
-
         exit 1
-
     fi
 
     hostnamectl set-hostname "$hostname"
@@ -593,19 +457,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Virtualmin installation
+# Step 4: Virtualmin installation
 # ---------------------------------------------------------------------------
 
 if ! step_done "virtualmin"; then
 
-    if [[ "$ARCH" == "arm64" ]]; then
+    # Do NOT apt update or install packages before Virtualmin.
+    # Virtualmin expects a clean minimal supported OS.
 
-        echo
-        log_error "IMPORTANT: This is an ARM64 system."
-        log_error "Virtualmin's current installer does not officially support ARM64."
-        log_error "The Virtualmin installation may fail at this point."
-        echo
-
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "curl is required to download the Virtualmin installer."
+        log_error "This script intentionally does not install packages before Virtualmin."
+        log_error "Use a minimal OS image that already provides curl."
+        exit 1
     fi
 
     log_step "Installing current Virtualmin using official installer"
@@ -628,36 +492,50 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 7: Docker installation
-#
-# Official Docker repository for Debian/Ubuntu.
+# Step 5: Administrator tools
 # ---------------------------------------------------------------------------
 
-OS_ID="$(. /etc/os-release && echo "$ID")"
-OS_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-DOCKER_ARCH="$(dpkg --print-architecture)"
+if ! step_done "admin_tools"; then
 
-case "$OS_ID" in
-    debian|ubuntu)
-        ;;
-    *)
-        log_error "Unsupported operating system for Docker repository: $OS_ID"
-        exit 1
-        ;;
-esac
+    log_step "Installing administrator tools after Virtualmin"
 
-case "$DOCKER_ARCH" in
-    amd64|arm64)
-        ;;
-    *)
-        log_error "Unsupported Docker architecture: $DOCKER_ARCH"
-        exit 1
-        ;;
-esac
+    apt-get update
+
+    apt-get install -y \
+        tmux \
+        btop \
+        wget
+
+    log_success "Administrator tools installed."
+
+    mark_done "admin_tools"
+
+else
+
+    log_success "Administrator tools already installed, skipping."
+
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6: Docker
+# ---------------------------------------------------------------------------
 
 if ! step_done "docker"; then
 
-    log_step "Installing Docker from the official Docker repository"
+    log_step "Installing Docker Engine"
+
+    case "$ARCH" in
+        amd64)
+            DOCKER_ARCH="amd64"
+            ;;
+        arm64)
+            DOCKER_ARCH="arm64"
+            ;;
+        *)
+            log_error "Unsupported Docker architecture: $ARCH"
+            exit 1
+            ;;
+    esac
 
     apt-get remove -y \
         docker.io \
@@ -715,12 +593,20 @@ fi
 # Add administrator to Docker group
 # ---------------------------------------------------------------------------
 
-usermod -aG docker "$sudo_user"
+if ! id -nG "$sudo_user" | tr ' ' '\n' | grep -qx "docker"; then
 
-log_success "User '$sudo_user' added to the Docker group."
+    usermod -aG docker "$sudo_user"
+
+    log_success "User '$sudo_user' added to the Docker group."
+
+else
+
+    log_success "User '$sudo_user' is already a member of the Docker group."
+
+fi
 
 # ---------------------------------------------------------------------------
-# Step 8: Portainer
+# Step 7: Portainer
 # ---------------------------------------------------------------------------
 
 if ! step_done "portainer"; then
@@ -739,42 +625,39 @@ name: portainer
 
 services:
 
-  portainer-ce:
-    image: portainer/portainer-ce:lts
+  portainer:
+
+    image: portainer/portainer-ce:latest
+
     container_name: portainer
-    restart: unless-stopped
+
+    restart: always
 
     ports:
-      - "127.0.0.1:8000:8000"
-      - "127.0.0.1:9443:9443"
+      - "8000:8000"
+      - "9443:9443"
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
 
 volumes:
 
   portainer_data:
     external: true
-    name: portainer_data
 EOF
 
     chown -R "$sudo_user:$USER_GROUP" "$PORTAINER_DIR"
 
-    (
-        cd "$PORTAINER_DIR"
-        docker compose up -d
-    )
+    chmod 750 "$PORTAINER_DIR"
+    chmod 640 "$PORTAINER_DIR/docker-compose.yaml"
 
-    if ! docker ps --format '{{.Names}}' | grep -qx "portainer"; then
+    runuser -u "$sudo_user" -- \
+        docker compose \
+        -f "$PORTAINER_DIR/docker-compose.yaml" \
+        up -d
 
-        log_error "Portainer container failed to start."
-
-        exit 1
-
-    fi
-
-    log_success "Portainer started successfully."
+    log_success "Portainer installed."
 
     mark_done "portainer"
 
@@ -785,7 +668,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 9: Optional Nextcloud AIO
+# Step 8: Optional Nextcloud AIO
 # ---------------------------------------------------------------------------
 
 install_nc="n"
@@ -853,6 +736,12 @@ else
     log_error "Docker: NOT running"
 fi
 
+if id -nG "$sudo_user" | tr ' ' '\n' | grep -qx "docker"; then
+    log_success "Docker group: '$sudo_user' is a member"
+else
+    log_error "Docker group: '$sudo_user' is NOT a member"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -860,46 +749,9 @@ fi
 log_step "Installation complete!"
 
 echo
-echo "============================================================"
-echo " Installation Summary"
-echo "============================================================"
-echo "Operating System : ${PRETTY_NAME:-unknown}"
-echo "Architecture     : $ARCH"
-echo "Hostname         : $hostname"
-echo "Virtualmin stack : $stack_choice"
-echo "Administrator    : $sudo_user"
-echo "SSH authentication: SSH key only"
-echo "Sudo             : NOPASSWD"
-echo "Docker           : installed"
-echo "Portainer        : installed"
-echo "NextCloud-AIO    : $([[ "$install_nc" =~ ^y$ ]] && echo "installed" || echo "not installed")"
-echo "============================================================"
+echo "Administrator: $sudo_user"
+echo "Virtualmin:    installed"
+echo "Docker:        installed"
+echo "Portainer:     installed"
+echo "Nextcloud AIO: $install_nc"
 echo
-echo "Access:"
-echo "Virtualmin/Webmin: https://$hostname:10000"
-echo "Portainer        : https://127.0.0.1:9443"
-
-if [[ "$install_nc" =~ ^y$ ]]; then
-
-    echo
-    echo "NextCloud AIO:"
-    echo "AIO setup interface: http://SERVER-IP:8080"
-    echo
-    echo "Complete the AIO setup before configuring the Apache"
-    echo "reverse proxy to port 11222."
-
-fi
-
-echo
-echo "SSH:"
-echo "  Password authentication: disabled"
-echo "  Root login: SSH key only"
-echo "  Administrator login: SSH key"
-echo
-echo "Setup log:"
-echo "  $LOG_FILE"
-echo
-echo "State file:"
-echo "  $STATE_FILE"
-echo
-echo "Installation completed successfully."
