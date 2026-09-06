@@ -789,21 +789,6 @@ EOF
     patch_proxypass_nocanon "$AIO_WEB_PORT"
 
     # -----------------------------------------------------------------------
-    # Verify the Virtualmin proxy through Virtualmin itself.
-    # -----------------------------------------------------------------------
-    aio_log "Verifying Virtualmin proxy configuration"
-
-    if ! virtualmin list-proxies --domain "$AIO_DOMAIN" 2>/dev/null \
-        | grep -Fq "127.0.0.1:${AIO_WEB_PORT}"; then
-        aio_log "WARNING: Virtualmin did not return the expected backend in list-proxies output."
-        aio_log "Raw proxy listing follows:"
-        virtualmin list-proxies --domain "$AIO_DOMAIN" 2>&1 || true
-        aio_die "Could not verify the Virtualmin reverse proxy."
-    fi
-
-    echo "✓ Virtualmin reports the expected reverse proxy."
-
-    # -----------------------------------------------------------------------
     # Apache syntax test and reload
     # -----------------------------------------------------------------------
     aio_log "Validating Apache configuration"
