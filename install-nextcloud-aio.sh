@@ -3,22 +3,29 @@
 # ============================================================
 # Nextcloud AIO installation behind Virtualmin Apache
 #
-# Uses Virtualmin native APIs:
+# Host-level responsibilities:
+#   root
+#     - Virtualmin
+#     - Apache
+#     - filesystem/system configuration
+#
+# Docker responsibilities:
+#   administrator user
+#     - docker
+#     - docker compose
+#     - AIO compose project
+#
+# Virtualmin APIs used:
 #   - create-domain
 #   - create-proxy
+#   - delete-proxy
 #   - modify-web
-#
-# No manual VirtualHost reconstruction.
-# No save_directive_struct().
 # ============================================================
 
 set -Eeuo pipefail
 
 LOG_FILE="/var/log/nextcloud-aio-install.log"
 STATE_FILE="/root/.nextcloud-aio-install.state"
-
-AIO_COMPOSE_DIR="/root/nextcloud-aio"
-AIO_COMPOSE_FILE="${AIO_COMPOSE_DIR}/docker-compose.yaml"
 
 AIO_DATA_DIR="/mnt/ncdata"
 
@@ -90,12 +97,60 @@ log "Starting Nextcloud AIO installation"
 # Required commands
 # ------------------------------------------------------------
 
-for command in docker virtualmin apache2ctl curl openssl; do
-
+for command in \
+    docker \
+    virtualmin \
+    apache2ctl \
+    curl \
+    openssl \
+    runuser \
+    ss
+do
     command -v "$command" >/dev/null 2>&1 \
         || die "Required command not found: $command"
-
 done
+
+# ------------------------------------------------------------
+# Administrator username
+# ------------------------------------------------------------
+
+ADMIN_USER="${1:-}"
+
+if [[ -z "$ADMIN_USER" ]]; then
+    die "Administrator username must be supplied as the first argument."
+fi
+
+if [[ "$ADMIN_USER" == "root" ]]; then
+    die "The Nextcloud AIO Docker administrator cannot be root."
+fi
+
+if ! id -u "$ADMIN_USER" >/dev/null 2>&1; then
+    die "Administrator user does not exist: $ADMIN_USER"
+fi
+
+ADMIN_HOME="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
+
+[[ -n "$ADMIN_HOME" ]] \
+    || die "Could not determine home directory for $ADMIN_USER."
+
+if ! id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx "docker"; then
+    die "User '$ADMIN_USER' is not a member of the docker group."
+fi
+
+AIO_COMPOSE_DIR="${ADMIN_HOME}/nextcloud-aio"
+AIO_COMPOSE_FILE="${AIO_COMPOSE_DIR}/docker-compose.yaml"
+
+log "Virtualmin administrator: $ADMIN_USER"
+log "Administrator home: $ADMIN_HOME"
+log "AIO Compose directory: $AIO_COMPOSE_DIR"
+
+# ------------------------------------------------------------
+# Run Docker commands as administrator
+# ------------------------------------------------------------
+
+run_as_admin() {
+    runuser -u "$ADMIN_USER" -- "$@"
+}
 
 # ------------------------------------------------------------
 # System information
@@ -124,59 +179,34 @@ apache2ctl -v | head -n 1 || true
 
 echo
 echo "Docker:"
-docker --version || true
+run_as_admin docker --version || true
 
 echo
 echo "Docker Compose:"
-docker compose version || true
+run_as_admin docker compose version || true
 
 # ------------------------------------------------------------
-# Administrator username
+# Domain
 # ------------------------------------------------------------
 
-ADMIN_USER="${1:-}"
+AIO_DOMAIN="${AIO_DOMAIN:-}"
 
-if [[ -z "$ADMIN_USER" ]]; then
+if [[ -z "$AIO_DOMAIN" ]]; then
 
-    read -r -p "Virtualmin administrator username [root]: " ADMIN_USER
-
-    ADMIN_USER="${ADMIN_USER:-root}"
+    read -r -p "Enter Nextcloud AIO domain: " AIO_DOMAIN
 
 fi
 
-log "Virtualmin administrator: $ADMIN_USER"
+AIO_DOMAIN="$(echo "$AIO_DOMAIN" | tr '[:upper:]' '[:lower:]')"
 
-# ------------------------------------------------------------
-# Ask for domain
-# ------------------------------------------------------------
-
-echo
-echo "============================================================"
-echo "Nextcloud AIO domain"
-echo "============================================================"
-echo
-echo "Enter the independent domain/subdomain that will be used"
-echo "for Nextcloud."
-echo
-echo "Example:"
-echo
-echo "  cloud.example.com"
-echo
-
-read -r -p "Nextcloud domain: " AIO_DOMAIN
-
-AIO_DOMAIN="${AIO_DOMAIN,,}"
-
-[[ -n "$AIO_DOMAIN" ]] || die "No domain was supplied."
-
-if [[ ! "$AIO_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-    die "Invalid domain name: $AIO_DOMAIN"
+if ! [[ "$AIO_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+    die "Invalid domain: $AIO_DOMAIN"
 fi
 
 log "Nextcloud domain: $AIO_DOMAIN"
 
 # ------------------------------------------------------------
-# Create state directory/file
+# State
 # ------------------------------------------------------------
 
 touch "$STATE_FILE"
@@ -211,17 +241,14 @@ if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
 
     log "Generating password for the Virtualmin domain"
 
-    DOMAIN_PASSWORD="$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 32)"
+    DOMAIN_PASSWORD="$(
+        openssl rand -base64 36 |
+        tr -dc 'A-Za-z0-9' |
+        head -c 32
+    )"
 
     [[ -n "$DOMAIN_PASSWORD" ]] \
         || die "Failed to generate Virtualmin domain password."
-
-    echo
-    echo "A random password has been generated for the Virtualmin"
-    echo "domain account. It is stored root-only in:"
-    echo
-    echo "  $STATE_FILE"
-    echo
 
 else
 
@@ -239,12 +266,15 @@ AIO_ADMIN_PORT='$AIO_ADMIN_PORT'
 AIO_WEB_PORT='$AIO_WEB_PORT'
 AIO_DATA_DIR='$AIO_DATA_DIR'
 AIO_COMPOSE_FILE='$AIO_COMPOSE_FILE'
+ADMIN_USER='$ADMIN_USER'
 EOF
 
 if [[ -n "$DOMAIN_PASSWORD" ]]; then
+
     cat >> "$STATE_FILE" <<EOF
 VIRTUALMIN_DOMAIN_PASSWORD='$DOMAIN_PASSWORD'
 EOF
+
 fi
 
 chmod 600 "$STATE_FILE"
@@ -269,37 +299,32 @@ if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
 
 else
 
-    log "Skipping Virtualmin domain creation because it already exists."
+    log "Virtualmin domain already exists; not recreating it."
 
 fi
+
+# ------------------------------------------------------------
+# Verify that Virtualmin can see the web domain
+# ------------------------------------------------------------
+
+log "Verifying Virtualmin domain"
+
+virtualmin list-domains --name-only 2>/dev/null \
+    | grep -Fxq "$AIO_DOMAIN" \
+    || die "Virtualmin does not report the domain after creation."
 
 # ------------------------------------------------------------
 # Apache modules
 # ------------------------------------------------------------
 
-log "Enabling required Apache modules"
+log "Enabling Apache proxy modules"
 
-REQUIRED_MODULES=(
-    proxy
-    proxy_http
-    proxy_wstunnel
-    rewrite
-    headers
-    ssl
-    http2
-)
-
-if command -v a2enmod >/dev/null 2>&1; then
-
-    for module in "${REQUIRED_MODULES[@]}"; do
-
-        echo "Enabling Apache module: $module"
-
-        a2enmod "$module" || true
-
-    done
-
-fi
+a2enmod proxy
+a2enmod proxy_http
+a2enmod proxy_wstunnel
+a2enmod headers
+a2enmod ssl
+a2enmod http2
 
 # ------------------------------------------------------------
 # Create Nextcloud data directory
@@ -315,7 +340,13 @@ chmod 755 "$AIO_DATA_DIR"
 # Docker Compose directory
 # ------------------------------------------------------------
 
+log "Creating administrator-owned AIO Compose directory"
+
 mkdir -p "$AIO_COMPOSE_DIR"
+
+chown "$ADMIN_USER:$(id -gn "$ADMIN_USER")" "$AIO_COMPOSE_DIR"
+
+chmod 750 "$AIO_COMPOSE_DIR"
 
 # ------------------------------------------------------------
 # Create Docker Compose file
@@ -366,13 +397,17 @@ volumes:
     name: nextcloud_aio_mastercontainer
 EOF
 
+chown "$ADMIN_USER:$(id -gn "$ADMIN_USER")" "$AIO_COMPOSE_FILE"
+chmod 640 "$AIO_COMPOSE_FILE"
+
 # ------------------------------------------------------------
 # Validate Docker Compose
 # ------------------------------------------------------------
 
-log "Validating Docker Compose configuration"
+log "Validating Docker Compose configuration as $ADMIN_USER"
 
-docker compose \
+run_as_admin \
+    docker compose \
     -f "$AIO_COMPOSE_FILE" \
     config >/dev/null \
     || die "Docker Compose configuration is invalid."
@@ -381,9 +416,10 @@ docker compose \
 # Start AIO
 # ------------------------------------------------------------
 
-log "Starting Nextcloud AIO"
+log "Starting Nextcloud AIO as $ADMIN_USER"
 
-docker compose \
+run_as_admin \
+    docker compose \
     -f "$AIO_COMPOSE_FILE" \
     up -d \
     || die "Failed to start Nextcloud AIO."
@@ -411,7 +447,6 @@ for i in $(seq 1 90); do
     fi
 
     printf "."
-
     sleep 2
 
 done
@@ -425,8 +460,68 @@ echo
 echo "✓ Nextcloud AIO administration interface is available."
 
 # ============================================================
-# TEST VIRTUALMIN NATIVE DIRECTIVE API
+# VIRTUALMIN / APACHE CONFIGURATION
 # ============================================================
+
+# ------------------------------------------------------------
+# Locate actual VirtualHost configuration files
+# ------------------------------------------------------------
+
+find_vhost_file() {
+
+    local domain="$1"
+    local ssl="$2"
+
+    local candidates=()
+
+    if [[ "$ssl" == "yes" ]]; then
+
+        candidates=(
+            "/etc/apache2/sites-enabled/${domain}.conf"
+            "/etc/apache2/sites-available/${domain}.conf"
+            "/etc/apache2/sites-enabled/${domain}-le-ssl.conf"
+            "/etc/apache2/sites-available/${domain}-le-ssl.conf"
+        )
+
+    else
+
+        candidates=(
+            "/etc/apache2/sites-enabled/${domain}.conf"
+            "/etc/apache2/sites-available/${domain}.conf"
+        )
+
+    fi
+
+    local file
+
+    for file in "${candidates[@]}"; do
+        if [[ -f "$file" ]] &&
+           grep -qi "<VirtualHost" "$file"; then
+            echo "$file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+HTTP_VHOST_FILE="$(find_vhost_file "$AIO_DOMAIN" no || true)"
+HTTPS_VHOST_FILE="$(find_vhost_file "$AIO_DOMAIN" yes || true)"
+
+echo
+echo "Detected Apache configuration:"
+echo "  HTTP : ${HTTP_VHOST_FILE:-NOT FOUND}"
+echo "  HTTPS: ${HTTPS_VHOST_FILE:-NOT FOUND}"
+
+[[ -n "$HTTP_VHOST_FILE" ]] \
+    || die "Could not locate the Apache HTTP VirtualHost for $AIO_DOMAIN."
+
+[[ -n "$HTTPS_VHOST_FILE" ]] \
+    || die "Could not locate the Apache HTTPS VirtualHost for $AIO_DOMAIN."
+
+# ------------------------------------------------------------
+# Test Virtualmin directive API
+# ------------------------------------------------------------
 
 log "Testing Virtualmin native --add-directive API"
 
@@ -451,23 +546,34 @@ if [[ "$TEST_EXIT_CODE" -ne 0 ]]; then
 
     rm -f "$TEST_OUTPUT"
 
-    die "Virtualmin --add-directive API is NOT available.
-
-The actual command failed:
-
-  virtualmin modify-web \\
-      --domain $AIO_DOMAIN \\
-      --add-directive \"$TEST_DIRECTIVE\""
+    die "Virtualmin --add-directive API failed."
 
 fi
 
 rm -f "$TEST_OUTPUT"
 
-echo
-echo "✓ Virtualmin --add-directive API works."
+# ------------------------------------------------------------
+# Verify temporary directive actually reached Apache
+# ------------------------------------------------------------
+
+log "Verifying that Virtualmin actually wrote the directive"
+
+if ! grep -Rqs \
+    --include='*.conf' \
+    -F "$TEST_DIRECTIVE" \
+    /etc/apache2/sites-enabled \
+    /etc/apache2/sites-available; then
+
+    virtualmin modify-web \
+        --domain "$AIO_DOMAIN" \
+        --remove-directive "$TEST_DIRECTIVE" \
+        >/dev/null 2>&1 || true
+
+    die "Virtualmin reported success, but '$TEST_DIRECTIVE' was not written to Apache configuration."
+fi
 
 # ------------------------------------------------------------
-# Remove temporary test directive
+# Remove temporary directive
 # ------------------------------------------------------------
 
 log "Removing temporary API test directive"
@@ -477,16 +583,11 @@ virtualmin modify-web \
     --remove-directive "$TEST_DIRECTIVE" \
     || die "Could not remove temporary test directive."
 
-echo "✓ Temporary directive removed."
-
 # ============================================================
 # CREATE NATIVE VIRTUALMIN PROXY
 # ============================================================
 
-log "Creating Virtualmin native reverse proxy"
-
-# Remove an existing proxy if this script was previously run.
-# Failure is harmless when no proxy exists.
+log "Removing any existing Virtualmin proxy"
 
 set +e
 
@@ -506,10 +607,10 @@ else
 fi
 
 # ------------------------------------------------------------
-# create-proxy
+# Create proxy
 # ------------------------------------------------------------
 
-log "Creating proxy: / -> http://127.0.0.1:${AIO_WEB_PORT}/"
+log "Creating Virtualmin reverse proxy"
 
 PROXY_OUTPUT="$(mktemp)"
 
@@ -538,8 +639,32 @@ fi
 
 rm -f "$PROXY_OUTPUT"
 
+# ------------------------------------------------------------
+# Verify actual proxy configuration
+# ------------------------------------------------------------
+
+log "Verifying actual Apache reverse-proxy configuration"
+
+if ! grep -Rqs \
+    --include='*.conf' \
+    -E 'ProxyPass|ProxyPassReverse' \
+    /etc/apache2/sites-enabled \
+    /etc/apache2/sites-available; then
+
+    die "Virtualmin reported successful proxy creation, but no ProxyPass/ProxyPassReverse directive was found in Apache configuration."
+fi
+
+if ! grep -Rqs \
+    --include='*.conf' \
+    "127.0.0.1:${AIO_WEB_PORT}" \
+    /etc/apache2/sites-enabled \
+    /etc/apache2/sites-available; then
+
+    die "Reverse proxy was not written with the expected AIO backend 127.0.0.1:${AIO_WEB_PORT}."
+fi
+
 echo
-echo "✓ Native Virtualmin reverse proxy created."
+echo "✓ Reverse proxy directives found in Apache configuration."
 
 # ============================================================
 # PROXY HOST
@@ -552,12 +677,9 @@ virtualmin modify-web \
     --proxy-host \
     || die "Virtualmin --proxy-host configuration failed."
 
-echo
-echo "✓ Proxy host configured."
-
-# ============================================================
-# HTTP PROTOCOLS
-# ============================================================
+# ------------------------------------------------------------
+# HTTP protocols
+# ------------------------------------------------------------
 
 log "Configuring HTTP protocols"
 
@@ -565,9 +687,6 @@ virtualmin modify-web \
     --domain "$AIO_DOMAIN" \
     --protocols "http/1.1 h2" \
     || die "Virtualmin protocol configuration failed."
-
-echo
-echo "✓ HTTP/2 and HTTP/1.1 configured."
 
 # ============================================================
 # NEXTCLOUD AIO APACHE DIRECTIVES
@@ -595,8 +714,44 @@ for directive in "${NATIVE_DIRECTIVES[@]}"; do
 
 done
 
+# ------------------------------------------------------------
+# Verify all directives were actually written
+# ------------------------------------------------------------
+
+log "Verifying Nextcloud Apache directives"
+
+for directive in "${NATIVE_DIRECTIVES[@]}"; do
+
+    if ! grep -Rqs \
+        --include='*.conf' \
+        -F "$directive" \
+        /etc/apache2/sites-enabled \
+        /etc/apache2/sites-available; then
+
+        die "Virtualmin reported success but Apache configuration does not contain: $directive"
+    fi
+
+done
+
 echo
-echo "✓ Nextcloud AIO Apache directives added."
+echo "✓ All Nextcloud Apache directives found in Apache configuration."
+
+# ============================================================
+# SHOW RESULTING VHOST CONFIGURATION
+# ============================================================
+
+log "Displaying resulting VirtualHost configuration"
+
+echo
+echo "---------------- HTTP VHOST ----------------"
+sed -n '/<VirtualHost/,/<\/VirtualHost>/p' "$HTTP_VHOST_FILE" || true
+
+echo
+echo "---------------- HTTPS VHOST ----------------"
+sed -n '/<VirtualHost/,/<\/VirtualHost>/p' "$HTTPS_VHOST_FILE" || true
+
+echo
+echo "------------------------------------------------------------"
 
 # ============================================================
 # APACHE CONFIGURATION TEST
@@ -629,17 +784,22 @@ echo "✓ Apache configuration is valid."
 log "Reloading Apache"
 
 if command -v systemctl >/dev/null 2>&1; then
-
     systemctl reload apache2
-
 else
-
     service apache2 reload
-
 fi
 
 echo
 echo "✓ Apache reloaded successfully."
+
+# ============================================================
+# VERIFY LIVE APACHE CONFIGURATION
+# ============================================================
+
+log "Verifying live Apache configuration"
+
+apache2ctl -S 2>&1 | grep -i "$AIO_DOMAIN" \
+    || die "Apache does not report the Nextcloud VirtualHost."
 
 # ============================================================
 # VERIFY PORTS
@@ -657,9 +817,9 @@ ss -lntp 2>/dev/null \
 # VERIFY CONTAINERS
 # ============================================================
 
-log "Checking Nextcloud AIO containers"
+log "Checking Nextcloud AIO containers as $ADMIN_USER"
 
-docker ps \
+run_as_admin docker ps \
     --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
     | grep -E 'nextcloud-aio|NAMES' \
     || true
@@ -674,49 +834,45 @@ echo "============================================================"
 echo "✓ NEXTCLOUD AIO INSTALLATION COMPLETE"
 echo "============================================================"
 echo
+
 echo "Nextcloud domain:"
 echo
 echo "  https://${AIO_DOMAIN}"
 echo
+
 echo "AIO administration interface:"
 echo
 echo "  http://SERVER-IP:${AIO_ADMIN_PORT}"
 echo
+
 echo "AIO internal Apache:"
 echo
 echo "  127.0.0.1:${AIO_WEB_PORT}"
 echo
+
 echo "Nextcloud data:"
 echo
 echo "  ${AIO_DATA_DIR}"
 echo
+
 echo "Docker Compose:"
 echo
 echo "  ${AIO_COMPOSE_FILE}"
 echo
+
+echo "Docker administrator:"
+echo
+echo "  ${ADMIN_USER}"
+echo
+
 echo "Installation log:"
 echo
 echo "  ${LOG_FILE}"
 echo
+
 echo "Virtualmin state:"
 echo
 echo "  ${STATE_FILE}"
 echo
-echo "============================================================"
-echo
-echo "NEXT STEPS"
-echo "============================================================"
-echo
-echo "1. Point DNS for ${AIO_DOMAIN} to this server."
-echo
-echo "2. Open:"
-echo
-echo "     https://${AIO_DOMAIN}"
-echo
-echo "3. Open the AIO administration interface:"
-echo
-echo "     http://SERVER-IP:${AIO_ADMIN_PORT}"
-echo
-echo "4. Complete the AIO setup."
-echo
+
 echo "============================================================"
