@@ -238,6 +238,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 2b: Nextcloud AIO decision (asked early, so an incompatible choice
+# fails fast instead of after Virtualmin/Docker/Portainer are already set up)
+# ---------------------------------------------------------------------------
+if [[ -f /root/.nextcloud_choice ]]; then
+    install_nc="$(cat /root/.nextcloud_choice)"
+else
+    read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
+    install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
+    echo "$install_nc" > /root/.nextcloud_choice
+fi
+
+if [[ "$install_nc" =~ ^y$ ]]; then
+    if [[ "$stack_choice" != "LAMP" ]]; then
+        log_error "Nextcloud AIO integration requires the LAMP/Apache Virtualmin stack."
+        log_error "Re-run this bootstrap and choose LAMP if you want the integrated AIO reverse proxy,"
+        log_error "or answer 'n' to the Nextcloud AIO question if you want to keep LEMP."
+        exit 1
+    fi
+    log_success "Nextcloud AIO selected; will be installed after Docker/Portainer are ready."
+else
+    log_success "NextCloud-AIO not selected."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 3: Hostname
 # ---------------------------------------------------------------------------
 if ! step_done "hostname"; then
@@ -426,24 +450,11 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 8: Optional Nextcloud AIO
+# (Decision + LAMP compatibility check already happened in Step 2b.)
 # ---------------------------------------------------------------------------
-install_nc="n"
-
-if [[ -f /root/.nextcloud_choice ]]; then
-    install_nc="$(cat /root/.nextcloud_choice)"
-else
-    read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
-    install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
-    echo "$install_nc" > /root/.nextcloud_choice
-fi
-
 if [[ "$install_nc" =~ ^y$ ]]; then
 
-    if [[ "$stack_choice" != "LAMP" ]]; then
-        log_error "Nextcloud AIO integration requires the LAMP/Apache Virtualmin stack."
-        log_error "Run this bootstrap with LAMP if you want the integrated AIO reverse proxy."
-        exit 1
-    fi
+  if ! step_done "nextcloud_aio"; then
 
     # -----------------------------------------------------------------------
     # Nextcloud AIO configuration
@@ -470,6 +481,46 @@ if [[ "$install_nc" =~ ^y$ ]]; then
         exit 1
     }
 
+    aio_warn() {
+        echo "⚠ $1" | tee -a "$AIO_LOG_FILE"
+    }
+
+    # Best-effort: add the 'nocanon' flag to the ProxyPass line Virtualmin
+    # generates. Virtualmin's create-proxy/modify-web CLI has no flag for
+    # this, so we patch the generated vhost file directly. Nextcloud's
+    # AllowEncodedSlashes NoDecode directive only has full effect if Apache
+    # doesn't canonicalize the URL before proxying it (affects some WebDAV /
+    # desktop-client requests with encoded slashes). This is optional
+    # hardening: on any failure we revert and continue rather than aborting.
+    patch_proxypass_nocanon() {
+        local port="$1"
+        local pattern="ProxyPass / http://127.0.0.1:${port}/"
+        local vhost_file
+        vhost_file="$(grep -rlF "$pattern" /etc/apache2/sites-enabled /etc/apache2/sites-available 2>/dev/null | head -n1 || true)"
+
+        if [[ -z "$vhost_file" ]]; then
+            aio_warn "Could not locate the generated ProxyPass line to add 'nocanon'; skipping this optional hardening step."
+            return 0
+        fi
+
+        if grep -qF "${pattern} nocanon" "$vhost_file"; then
+            aio_log "ProxyPass 'nocanon' flag already present in $vhost_file."
+            return 0
+        fi
+
+        local backup="${vhost_file}.pre-nocanon-$(date +%Y%m%d_%H%M%S)"
+        cp -a "$vhost_file" "$backup"
+
+        if sed -i "s#${pattern}\$#${pattern} nocanon#" "$vhost_file" && apache2ctl configtest 2>/dev/null; then
+            systemctl reload apache2
+            aio_log "Added 'nocanon' to the ProxyPass directive in $vhost_file."
+        else
+            aio_warn "Adding 'nocanon' produced an invalid Apache config; reverting $vhost_file."
+            cp -a "$backup" "$vhost_file"
+            apache2ctl configtest >/dev/null 2>&1 || true
+        fi
+    }
+
     touch "$AIO_LOG_FILE" "$AIO_STATE_FILE"
     chmod 600 "$AIO_STATE_FILE"
 
@@ -485,7 +536,8 @@ if [[ "$install_nc" =~ ^y$ ]]; then
     echo "============================================================"
     echo
     echo "Enter the independent domain/subdomain that will be used"
-    echo "for Nextcloud."
+    echo "for Nextcloud. DNS for this domain must already point at this"
+    echo "server's public IP before continuing."
     echo
     read -r -p "Nextcloud domain: " AIO_DOMAIN
     AIO_DOMAIN="${AIO_DOMAIN,,}"
@@ -544,6 +596,32 @@ EOF
         aio_log "Skipping Virtualmin domain creation because it already exists."
     fi
 
+    # -----------------------------------------------------------------------
+    # Explicitly request (and verify) a trusted Let's Encrypt certificate.
+    # --ssl alone only guarantees a self-signed cert; Virtualmin's automatic
+    # LE request at domain-creation time depends on DNS already resolving
+    # to this server. --check-first surfaces connectivity problems clearly
+    # instead of a generic ACME failure. This step warns rather than aborts,
+    # since AllowEncodedSlashes etc. and the reverse proxy itself still work
+    # with a self-signed cert - only public trust is affected.
+    # -----------------------------------------------------------------------
+    aio_log "Requesting a Let's Encrypt certificate for $AIO_DOMAIN"
+    set +e
+    virtualmin generate-letsencrypt-cert \
+        --domain "$AIO_DOMAIN" \
+        --check-first \
+        --renew \
+        >>"$AIO_LOG_FILE" 2>&1
+    LETSENCRYPT_EXIT=$?
+    set -e
+    if [[ "$LETSENCRYPT_EXIT" -ne 0 ]]; then
+        aio_warn "Could not obtain a Let's Encrypt certificate for $AIO_DOMAIN (see $AIO_LOG_FILE)."
+        aio_warn "The domain will keep its self-signed certificate; browsers and the Nextcloud"
+        aio_warn "desktop/mobile clients will show a trust warning until this is resolved."
+    else
+        echo "✓ Let's Encrypt certificate issued for $AIO_DOMAIN."
+    fi
+
     aio_log "Enabling required Apache modules"
     REQUIRED_MODULES=(proxy proxy_http proxy_wstunnel rewrite headers ssl http2)
     for module in "${REQUIRED_MODULES[@]}"; do
@@ -566,6 +644,7 @@ services:
   nextcloud-aio-mastercontainer:
     image: ${AIO_IMAGE}
     container_name: nextcloud-aio-mastercontainer
+    init: true
     restart: always
 
     ports:
@@ -579,11 +658,10 @@ services:
     environment:
       APACHE_PORT: ${AIO_WEB_PORT}
       APACHE_IP_BINDING: 127.0.0.1
-      SKIP_DOMAIN_VALIDATION: true
+      SKIP_DOMAIN_VALIDATION: false
       NEXTCLOUD_DATADIR: /mnt/ncdata
       NEXTCLOUD_MOUNT: /mnt/
       NEXTCLOUD_STARTUP_APPS: twofactor_totp calendar contacts files_external
-      NEXTCLOUD_ENABLE_DRI_DEVICE: false
 
 volumes:
 
@@ -602,27 +680,31 @@ EOF
     run_as_admin "$AIO_COMPOSE_DIR" docker compose -f docker-compose.yaml up -d \
         || aio_die "Failed to start Nextcloud AIO."
 
-    aio_log "Waiting for AIO administration interface"
+    aio_log "Checking AIO administration interface (10 seconds)"
     AIO_READY=0
-    for i in $(seq 1 90); do
-        if curl --silent --show-error --insecure --max-time 3 \
+    for i in $(seq 1 10); do
+        if curl --silent --show-error --insecure --max-time 1 \
             "https://127.0.0.1:${AIO_ADMIN_PORT}/" >/dev/null 2>&1; then
             AIO_READY=1
             break
         fi
         printf "."
-        sleep 2
+        sleep 1
     done
     echo
 
-    [[ "$AIO_READY" -eq 1 ]] || aio_die "Nextcloud AIO did not become available on port ${AIO_ADMIN_PORT}."
-    echo "✓ Nextcloud AIO administration interface is available."
+    if [[ "$AIO_READY" -eq 1 ]]; then
+        echo "✓ Nextcloud AIO administration interface is available."
+    else
+        echo "⚠ Nextcloud AIO administration interface is not available yet on port ${AIO_ADMIN_PORT}."
+        echo "  Continuing with Virtualmin/Apache configuration; AIO may still be starting."
+    fi
 
     # -----------------------------------------------------------------------
     # Test Virtualmin directive API
     # -----------------------------------------------------------------------
     aio_log "Testing Virtualmin native --add-directive API"
-    TEST_DIRECTIVE="LimitRequestBody 0"
+    TEST_DIRECTIVE="SetEnv VIRTUALMIN_AIO_TEST 1"
     TEST_OUTPUT="$(mktemp)"
 
     set +e
@@ -697,10 +779,17 @@ EOF
 
     # -----------------------------------------------------------------------
     # Nextcloud AIO Apache directives
+    #
+    # ProxyPreserveHost On is added first: without it, the AIO Apache
+    # container behind the proxy sees Host: 127.0.0.1:<port> instead of the
+    # real domain, which breaks Nextcloud's own domain/redirect handling.
+    # Each directive is removed before being (re-)added so this block stays
+    # idempotent even if it's ever re-run outside the step_done guard above.
     # -----------------------------------------------------------------------
     aio_log "Adding Nextcloud AIO Apache directives"
 
     NATIVE_DIRECTIVES=(
+        "ProxyPreserveHost On"
         "AllowEncodedSlashes NoDecode"
         "H2WindowSize 5242880"
         "TraceEnable off"
@@ -710,16 +799,25 @@ EOF
     )
 
     for directive in "${NATIVE_DIRECTIVES[@]}"; do
-        aio_log "Adding Apache directive: $directive"
+        aio_log "Setting Apache directive: $directive"
+        virtualmin modify-web \
+            --domain "$AIO_DOMAIN" \
+            --remove-directive "$directive" \
+            >/dev/null 2>&1 || true
         virtualmin modify-web \
             --domain "$AIO_DOMAIN" \
             --add-directive "$directive" \
             || aio_die "Failed to add Apache directive: $directive"
     done
 
+    # Optional hardening Virtualmin's CLI has no flag for - see function def.
+    patch_proxypass_nocanon "$AIO_WEB_PORT"
+
     # -----------------------------------------------------------------------
     # Verify the Virtualmin proxy through Virtualmin itself.
-    # This is verification only; we never edit generated Apache files.
+    # This is verification only; we never edit generated Apache files
+    # (other than the best-effort nocanon patch above, which validates and
+    # reverts itself on failure).
     # -----------------------------------------------------------------------
     aio_log "Verifying Virtualmin proxy configuration"
 
@@ -777,6 +875,9 @@ EOF
     echo
     echo "AIO administration interface:"
     echo "  https://SERVER-IP:${AIO_ADMIN_PORT}"
+    echo "  (Reachable from the internet by design, per the Nextcloud AIO docs -"
+    echo "   its own self-signed cert is expected. Firewall this port once initial"
+    echo "   setup is done if you don't want it publicly reachable long-term.)"
     echo
     echo "AIO Apache backend:"
     echo "  127.0.0.1:${AIO_WEB_PORT}"
@@ -792,6 +893,13 @@ EOF
     echo
     echo "Complete the remaining AIO setup through the AIO interface."
     echo
+
+    mark_done "nextcloud_aio"
+
+  else
+    log_success "Nextcloud AIO already installed, skipping."
+  fi
+
 else
     log_success "NextCloud-AIO not selected."
 fi
@@ -841,6 +949,8 @@ echo
 echo "Access:"
 echo "Virtualmin/Webmin: https://$hostname:10000"
 echo "Portainer        : https://127.0.0.1:9443"
+echo "  (bound to localhost - reach it via an SSH tunnel, e.g.:"
+echo "   ssh -L 9443:127.0.0.1:9443 $sudo_user@$hostname)"
 if [[ "$install_nc" =~ ^y$ ]]; then
     echo
     echo "NextCloud AIO:"
