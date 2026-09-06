@@ -602,7 +602,7 @@ EOF
     chmod 600 "$AIO_STATE_FILE"
 
     if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
-        aio_log "Creating Virtualmin domain: $AIO_DOMAIN"
+        aio_log "Creating Virtualmin domain without mail feature: $AIO_DOMAIN"
         virtualmin create-domain \
             --domain "$AIO_DOMAIN" \
             --pass "$DOMAIN_PASSWORD" \
@@ -610,6 +610,7 @@ EOF
             --dir \
             --web \
             --ssl \
+            --no-features mail \
             --skip-warnings \
             || aio_die "Virtualmin failed to create $AIO_DOMAIN."
     else
