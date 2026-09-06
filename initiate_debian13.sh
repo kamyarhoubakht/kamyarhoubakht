@@ -680,9 +680,9 @@ EOF
     run_as_admin "$AIO_COMPOSE_DIR" docker compose -f docker-compose.yaml up -d \
         || aio_die "Failed to start Nextcloud AIO."
 
-    aio_log "Checking AIO administration interface (10 seconds)"
+    aio_log "Checking AIO administration interface (30 seconds)"
     AIO_READY=0
-    for i in $(seq 1 10); do
+    for i in $(seq 1 30); do
         if curl --silent --show-error --insecure --max-time 1 \
             "https://127.0.0.1:${AIO_ADMIN_PORT}/" >/dev/null 2>&1; then
             AIO_READY=1
@@ -732,6 +732,17 @@ EOF
     # -----------------------------------------------------------------------
     # Create native Virtualmin proxy
     # -----------------------------------------------------------------------
+    aio_log "Setting up Let's Encrypt ACME challenge exclusion"
+    virtualmin modify-web \
+        --domain "$AIO_DOMAIN" \
+        --remove-directive "ProxyPass /.well-known !" \
+        >/dev/null 2>&1 || true
+
+    virtualmin modify-web \
+        --domain "$AIO_DOMAIN" \
+        --add-directive "ProxyPass /.well-known !" \
+        || aio_die "Failed to add ACME proxy exclusion."
+
     aio_log "Creating Virtualmin reverse proxy: / -> http://127.0.0.1:${AIO_WEB_PORT}/"
 
     PROXY_OUTPUT="$(mktemp)"
