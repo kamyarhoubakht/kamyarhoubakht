@@ -734,20 +734,6 @@ EOF
     # -----------------------------------------------------------------------
     aio_log "Creating Virtualmin reverse proxy: / -> http://127.0.0.1:${AIO_WEB_PORT}/"
 
-    set +e
-    virtualmin delete-proxy \
-        --domain "$AIO_DOMAIN" \
-        --path "/" \
-        >/tmp/nextcloud-aio-delete-proxy.log 2>&1
-    DELETE_EXIT=$?
-    set -e
-
-    if [[ "$DELETE_EXIT" -eq 0 ]]; then
-        echo "Existing proxy removed."
-    else
-        echo "No existing proxy found."
-    fi
-
     PROXY_OUTPUT="$(mktemp)"
     set +e
     virtualmin create-proxy \
