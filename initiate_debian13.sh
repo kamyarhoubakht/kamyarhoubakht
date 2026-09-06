@@ -616,32 +616,6 @@ EOF
         aio_log "Skipping Virtualmin domain creation because it already exists."
     fi
 
-    # -----------------------------------------------------------------------
-    # Explicitly request (and verify) a trusted Let's Encrypt certificate.
-    # --ssl alone only guarantees a self-signed cert; Virtualmin's automatic
-    # LE request at domain-creation time depends on DNS already resolving
-    # to this server. --check-first surfaces connectivity problems clearly
-    # instead of a generic ACME failure. This step warns rather than aborts,
-    # since AllowEncodedSlashes etc. and the reverse proxy itself still work
-    # with a self-signed cert - only public trust is affected.
-    # -----------------------------------------------------------------------
-    aio_log "Requesting a Let's Encrypt certificate for $AIO_DOMAIN"
-    set +e
-    virtualmin generate-letsencrypt-cert \
-        --domain "$AIO_DOMAIN" \
-        --check-first \
-        --renew \
-        >>"$AIO_LOG_FILE" 2>&1
-    LETSENCRYPT_EXIT=$?
-    set -e
-    if [[ "$LETSENCRYPT_EXIT" -ne 0 ]]; then
-        aio_warn "Could not obtain a Let's Encrypt certificate for $AIO_DOMAIN (see $AIO_LOG_FILE)."
-        aio_warn "The domain will keep its self-signed certificate; browsers and the Nextcloud"
-        aio_warn "desktop/mobile clients will show a trust warning until this is resolved."
-    else
-        echo "✓ Let's Encrypt certificate issued for $AIO_DOMAIN."
-    fi
-
     aio_log "Enabling required Apache modules"
     REQUIRED_MODULES=(proxy proxy_http proxy_wstunnel rewrite headers ssl http2)
     for module in "${REQUIRED_MODULES[@]}"; do
