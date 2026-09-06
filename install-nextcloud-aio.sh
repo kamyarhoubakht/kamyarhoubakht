@@ -3,37 +3,16 @@
 # ============================================================
 # Nextcloud AIO installation behind Virtualmin Apache
 #
-# Uses ONLY Virtualmin's native APIs for Apache configuration:
+# Uses Virtualmin native APIs:
+#   - create-domain
 #   - create-proxy
 #   - modify-web
 #
 # No manual VirtualHost reconstruction.
 # No save_directive_struct().
-#
-# Architecture:
-#
-#   Internet
-#      |
-#      v
-#   Virtualmin Apache :80 / :443
-#      |
-#      v
-#   Virtualmin create-proxy
-#      |
-#      v
-#   127.0.0.1:11222
-#      |
-#      v
-#   Nextcloud AIO Apache
-#
-# AIO management interface:
-#   http://SERVER-IP:8080
-#
 # ============================================================
 
 set -Eeuo pipefail
-
-SCRIPT_NAME="install-nextcloud-aio.sh"
 
 LOG_FILE="/var/log/nextcloud-aio-install.log"
 STATE_FILE="/root/.nextcloud-aio-install.state"
@@ -78,12 +57,6 @@ die() {
     exit 1
 }
 
-run_cmd() {
-    echo
-    echo "+ $*"
-    "$@"
-}
-
 on_error() {
     local exit_code=$?
 
@@ -119,9 +92,8 @@ log "Starting Nextcloud AIO installation"
 
 for command in docker virtualmin apache2ctl curl openssl; do
 
-    if ! command -v "$command" >/dev/null 2>&1; then
-        die "Required command not found: $command"
-    fi
+    command -v "$command" >/dev/null 2>&1 \
+        || die "Required command not found: $command"
 
 done
 
@@ -204,6 +176,60 @@ fi
 log "Nextcloud domain: $AIO_DOMAIN"
 
 # ------------------------------------------------------------
+# Create state directory/file
+# ------------------------------------------------------------
+
+touch "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+# ------------------------------------------------------------
+# Check whether domain already exists
+# ------------------------------------------------------------
+
+log "Checking Virtualmin domain"
+
+if virtualmin list-domains --name-only 2>/dev/null \
+    | grep -Fxq "$AIO_DOMAIN"; then
+
+    echo
+    echo "Virtualmin domain already exists:"
+    echo "  $AIO_DOMAIN"
+
+    DOMAIN_EXISTS=1
+
+else
+
+    DOMAIN_EXISTS=0
+
+fi
+
+# ------------------------------------------------------------
+# Generate Virtualmin domain password
+# ------------------------------------------------------------
+
+if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
+
+    log "Generating password for the Virtualmin domain"
+
+    DOMAIN_PASSWORD="$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 32)"
+
+    [[ -n "$DOMAIN_PASSWORD" ]] \
+        || die "Failed to generate Virtualmin domain password."
+
+    echo
+    echo "A random password has been generated for the Virtualmin"
+    echo "domain account. It is stored root-only in:"
+    echo
+    echo "  $STATE_FILE"
+    echo
+
+else
+
+    DOMAIN_PASSWORD=""
+
+fi
+
+# ------------------------------------------------------------
 # Save state
 # ------------------------------------------------------------
 
@@ -215,30 +241,35 @@ AIO_DATA_DIR='$AIO_DATA_DIR'
 AIO_COMPOSE_FILE='$AIO_COMPOSE_FILE'
 EOF
 
+if [[ -n "$DOMAIN_PASSWORD" ]]; then
+    cat >> "$STATE_FILE" <<EOF
+VIRTUALMIN_DOMAIN_PASSWORD='$DOMAIN_PASSWORD'
+EOF
+fi
+
+chmod 600 "$STATE_FILE"
+
 # ------------------------------------------------------------
 # Create Virtualmin domain
 # ------------------------------------------------------------
 
-log "Checking Virtualmin domain"
-
-if virtualmin list-domains --name-only 2>/dev/null \
-    | grep -Fxq "$AIO_DOMAIN"; then
-
-    echo "Virtualmin domain already exists:"
-    echo "  $AIO_DOMAIN"
-
-else
+if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
 
     log "Creating Virtualmin domain: $AIO_DOMAIN"
 
     virtualmin create-domain \
         --domain "$AIO_DOMAIN" \
+        --pass "$DOMAIN_PASSWORD" \
         --unix \
         --dir \
         --web \
         --ssl \
         --skip-warnings \
         || die "Virtualmin failed to create $AIO_DOMAIN."
+
+else
+
+    log "Skipping Virtualmin domain creation because it already exists."
 
 fi
 
@@ -391,27 +422,13 @@ echo
     || die "Nextcloud AIO did not become available on port ${AIO_ADMIN_PORT}."
 
 echo
-echo "Nextcloud AIO administration interface is available."
+echo "✓ Nextcloud AIO administration interface is available."
 
 # ============================================================
-# VIRTUALMIN NATIVE API
+# TEST VIRTUALMIN NATIVE DIRECTIVE API
 # ============================================================
 
 log "Testing Virtualmin native --add-directive API"
-
-# ------------------------------------------------------------
-# IMPORTANT
-#
-# Do NOT test this using:
-#
-#   virtualmin help modify-web
-#
-# The help output is not a reliable capability test across
-# Virtualmin versions.
-#
-# Instead, perform the same real operation that we need,
-# using a harmless temporary directive.
-# ------------------------------------------------------------
 
 TEST_DIRECTIVE="LimitRequestBody 0"
 
@@ -440,10 +457,7 @@ The actual command failed:
 
   virtualmin modify-web \\
       --domain $AIO_DOMAIN \\
-      --add-directive \"$TEST_DIRECTIVE\"
-
-This installation cannot continue using the native Virtualmin
-directive API."
+      --add-directive \"$TEST_DIRECTIVE\""
 
 fi
 
@@ -471,15 +485,8 @@ echo "✓ Temporary directive removed."
 
 log "Creating Virtualmin native reverse proxy"
 
-# ------------------------------------------------------------
-# Remove an old proxy if this installation was previously
-# attempted.
-#
-# Failure is harmless because a new installation normally has
-# no proxy yet.
-# ------------------------------------------------------------
-
-echo "Checking for an existing proxy..."
+# Remove an existing proxy if this script was previously run.
+# Failure is harmless when no proxy exists.
 
 set +e
 
@@ -493,28 +500,13 @@ DELETE_EXIT=$?
 set -e
 
 if [[ "$DELETE_EXIT" -eq 0 ]]; then
-
     echo "Existing proxy removed."
-
 else
-
     echo "No existing proxy found."
-
 fi
 
 # ------------------------------------------------------------
 # create-proxy
-#
-# This is the important part.
-#
-# Virtualmin itself creates:
-#
-#   ProxyPass
-#   ProxyPassReverse
-#   websocket handling
-#   X-Forwarded-Proto handling
-#
-# without manually modifying the VirtualHost structure.
 # ------------------------------------------------------------
 
 log "Creating proxy: / -> http://127.0.0.1:${AIO_WEB_PORT}/"
@@ -569,9 +561,6 @@ echo "✓ Proxy host configured."
 
 log "Configuring HTTP protocols"
 
-# Use the dedicated --protocols API rather than --add-directive
-# because Protocols accepts multiple values.
-
 virtualmin modify-web \
     --domain "$AIO_DOMAIN" \
     --protocols "http/1.1 h2" \
@@ -585,29 +574,6 @@ echo "✓ HTTP/2 and HTTP/1.1 configured."
 # ============================================================
 
 log "Adding Nextcloud AIO Apache directives"
-
-# ------------------------------------------------------------
-# IMPORTANT:
-#
-# Current Virtualmin --add-directive parsing accepts:
-#
-#     DIRECTIVE VALUE
-#
-# with VALUE being one whitespace-separated token.
-#
-# Therefore these directives are deliberately limited to
-# directives whose value is a single token.
-#
-# We DO NOT attempt:
-#
-#   RequestHeader set X-Real-IP %{REMOTE_ADDR}s
-#
-# because that requires multiple value tokens and cannot safely
-# be represented through the current --add-directive interface.
-#
-# X-Forwarded-Proto is already handled by Virtualmin's native
-# proxy implementation.
-# ------------------------------------------------------------
 
 NATIVE_DIRECTIVES=(
     "AllowEncodedSlashes NoDecode"
@@ -643,10 +609,9 @@ if ! apache2ctl configtest; then
     echo
     echo "❌ Apache configuration test FAILED."
     echo
-    echo "The configuration has NOT been reloaded."
+    echo "Apache has NOT been reloaded."
     echo
     echo "Review:"
-    echo
     echo "  $LOG_FILE"
     echo
 
@@ -733,7 +698,7 @@ echo "Installation log:"
 echo
 echo "  ${LOG_FILE}"
 echo
-echo "State:"
+echo "Virtualmin state:"
 echo
 echo "  ${STATE_FILE}"
 echo
