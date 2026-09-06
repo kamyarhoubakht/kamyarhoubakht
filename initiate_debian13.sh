@@ -726,17 +726,6 @@ EOF
     # -----------------------------------------------------------------------
     # Create native Virtualmin proxy
     # -----------------------------------------------------------------------
-    aio_log "Setting up Let's Encrypt ACME challenge exclusion"
-    virtualmin modify-web \
-        --domain "$AIO_DOMAIN" \
-        --remove-directive "ProxyPass /.well-known !" \
-        >/dev/null 2>&1 || true
-
-    virtualmin modify-web \
-        --domain "$AIO_DOMAIN" \
-        --add-directive "ProxyPass /.well-known !" \
-        || aio_die "Failed to add ACME proxy exclusion."
-
     aio_log "Creating Virtualmin reverse proxy: / -> http://127.0.0.1:${AIO_WEB_PORT}/"
 
     PROXY_OUTPUT="$(mktemp)"
@@ -770,12 +759,6 @@ EOF
 
     # -----------------------------------------------------------------------
     # Nextcloud AIO Apache directives
-    #
-    # ProxyPreserveHost On is added first: without it, the AIO Apache
-    # container behind the proxy sees Host: 127.0.0.1:<port> instead of the
-    # real domain, which breaks Nextcloud's own domain/redirect handling.
-    # Each directive is removed before being (re-)added so this block stays
-    # idempotent even if it's ever re-run outside the step_done guard above.
     # -----------------------------------------------------------------------
     aio_log "Adding Nextcloud AIO Apache directives"
 
@@ -806,9 +789,6 @@ EOF
 
     # -----------------------------------------------------------------------
     # Verify the Virtualmin proxy through Virtualmin itself.
-    # This is verification only; we never edit generated Apache files
-    # (other than the best-effort nocanon patch above, which validates and
-    # reverts itself on failure).
     # -----------------------------------------------------------------------
     aio_log "Verifying Virtualmin proxy configuration"
 
@@ -839,7 +819,7 @@ EOF
     echo "✓ Apache reloaded successfully."
 
     # -----------------------------------------------------------------------
-    # Verify Apache's loaded vhosts, but NEVER modify them directly.
+    # Verify Apache's loaded vhosts
     # -----------------------------------------------------------------------
     aio_log "Verifying Apache's loaded VirtualHost configuration"
     apache2ctl -S 2>&1 | grep -i "$AIO_DOMAIN" \
@@ -866,9 +846,6 @@ EOF
     echo
     echo "AIO administration interface:"
     echo "  https://SERVER-IP:${AIO_ADMIN_PORT}"
-    echo "  (Reachable from the internet by design, per the Nextcloud AIO docs -"
-    echo "   its own self-signed cert is expected. Firewall this port once initial"
-    echo "   setup is done if you don't want it publicly reachable long-term.)"
     echo
     echo "AIO Apache backend:"
     echo "  127.0.0.1:${AIO_WEB_PORT}"
