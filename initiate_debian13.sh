@@ -861,8 +861,6 @@ EOF
 
         virtualmin modify-template \
             --name "Reverse Proxy" \
-            --setting default --value 0 \
-            --setting standard --value 0 \
             --setting mysql_mkdb --value 0 \
             --setting skel --value "" \
             --setting ushell --value "/dev/null" \
@@ -873,15 +871,6 @@ EOF
             --setting mail_subject --value "" \
             || aio_die \
                 "Failed to configure Virtualmin 'Reverse Proxy' template."
-
-
-        virtualmin modify-template \
-            --name "Reverse Proxy" \
-            --setting web \
-            --value 'ServerName ${DOM} ServerAlias ${DOM} DocumentRoot ${HOME}/public_html ErrorLog /var/log/virtualmin/${DOM}_error_log CustomLog /var/log/virtualmin/${DOM}_access_log combined ScriptAlias /cgi-bin/ ${HOME}/cgi-bin/ DirectoryIndex index.php index.htm index.html <Directory ${HOME}/public_html> Options -Indexes +IncludesNOEXEC +SymLinksIfOwnerMatch Require all granted AllowOverride All Options=ExecCGI,Includes,IncludesNOEXEC,Indexes,MultiViews,SymLinksIfOwnerMatch </Directory> <Directory ${HOME}/cgi-bin> Require all granted AllowOverride All Options=ExecCGI,Includes,IncludesNOEXEC,Indexes,MultiViews,SymLinksIfOwnerMatch </Directory>' \
-            || aio_die \
-                "Failed to configure Apache web settings in 'Reverse Proxy' template."
-
 
         log_success \
             "Virtualmin 'Reverse Proxy' Server Template created and configured."
@@ -933,10 +922,6 @@ EOF
             --features-from-plan \
             --limits-from-plan \
             --skip-warnings \
-            --unix \
-            --logrotate \
-            --ssl \
-            --web \
             || aio_die \
                 "Virtualmin failed to create $AIO_DOMAIN."
 
