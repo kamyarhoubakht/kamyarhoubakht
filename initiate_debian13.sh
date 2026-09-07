@@ -586,10 +586,10 @@ EOF
         
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json <<EOF 
-    {
-      "firewall-backend": "nftables"
-    }
-    EOF
+{
+    "firewall-backend": "nftables"
+}
+EOF
 
     systemctl enable --now docker
 
