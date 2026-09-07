@@ -55,11 +55,11 @@ case "$OS_ID" in
         ;;
     ubuntu)
         case "$OS_VERSION_ID" in
-            22.04|24.04) log_success "Supported Ubuntu version detected: $OS_VERSION_ID" ;;
-            *) log_error "Unsupported Ubuntu version: $OS_VERSION_ID"; log_error "Supported Ubuntu versions: 22.04, 24.04 LTS"; exit 1 ;;
+            24.04|26.04) log_success "Supported Ubuntu version detected: $OS_VERSION_ID" ;;
+            *) log_error "Unsupported Ubuntu version: $OS_VERSION_ID"; log_error "Supported Ubuntu versions: 24.04, 26.04 LTS"; exit 1 ;;
         esac
         ;;
-    *) log_error "Unsupported operating system."; log_error "This script supports Debian 12/13 and Ubuntu 22.04/24.04 LTS."; exit 1 ;;
+    *) log_error "Unsupported operating system."; log_error "This script supports Debian 12/13 and Ubuntu 24.04/26.04 LTS."; exit 1 ;;
 esac
 
 ARCH="$(dpkg --print-architecture)"
@@ -505,46 +505,10 @@ if [[ "$install_nc" =~ ^y$ ]]; then
         echo "⚠ $1" | tee -a "$AIO_LOG_FILE"
     }
 
-    # Best-effort: add the 'nocanon' flag to the ProxyPass line Virtualmin
-    # generates. Virtualmin's create-proxy/modify-web CLI has no flag for
-    # this, so we patch the generated vhost file directly. Nextcloud's
-    # AllowEncodedSlashes NoDecode directive only has full effect if Apache
-    # doesn't canonicalize the URL before proxying it (affects some WebDAV /
-    # desktop-client requests with encoded slashes). This is optional
-    # hardening: on any failure we revert and continue rather than aborting.
-    patch_proxypass_nocanon() {
-        local port="$1"
-        local pattern="ProxyPass / http://127.0.0.1:${port}/"
-        local vhost_file
-        vhost_file="$(grep -rlF "$pattern" /etc/apache2/sites-enabled /etc/apache2/sites-available 2>/dev/null | head -n1 || true)"
-
-        if [[ -z "$vhost_file" ]]; then
-            aio_warn "Could not locate the generated ProxyPass line to add 'nocanon'; skipping this optional hardening step."
-            return 0
-        fi
-
-        if grep -qF "${pattern} nocanon" "$vhost_file"; then
-            aio_log "ProxyPass 'nocanon' flag already present in $vhost_file."
-            return 0
-        fi
-
-        local backup="${vhost_file}.pre-nocanon-$(date +%Y%m%d_%H%M%S)"
-        cp -a "$vhost_file" "$backup"
-
-        if sed -i "s#${pattern}\$#${pattern} nocanon#" "$vhost_file" && apache2ctl configtest 2>/dev/null; then
-            systemctl reload apache2
-            aio_log "Added 'nocanon' to the ProxyPass directive in $vhost_file."
-        else
-            aio_warn "Adding 'nocanon' produced an invalid Apache config; reverting $vhost_file."
-            cp -a "$backup" "$vhost_file"
-            apache2ctl configtest >/dev/null 2>&1 || true
-        fi
-    }
-
     touch "$AIO_LOG_FILE" "$AIO_STATE_FILE"
     chmod 600 "$AIO_STATE_FILE"
 
-    for command in virtualmin apache2ctl curl openssl runuser ss; do
+    for command in virtualmin apache2ctl curl openssl runuser; do
         command -v "$command" >/dev/null 2>&1 || aio_die "Required command not found: $command"
     done
 
@@ -579,7 +543,7 @@ if [[ "$install_nc" =~ ^y$ ]]; then
 
     if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
         aio_log "Generating password for the Virtualmin domain"
-        DOMAIN_PASSWORD="$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 32)"
+        DOMAIN_PASSWORD="$(openssl rand -hex 16)"
         [[ -n "$DOMAIN_PASSWORD" ]] || aio_die "Failed to generate Virtualmin domain password."
     else
         DOMAIN_PASSWORD=""
@@ -602,7 +566,7 @@ EOF
     chmod 600 "$AIO_STATE_FILE"
 
     if [[ "$DOMAIN_EXISTS" -eq 0 ]]; then
-        aio_log "Creating Virtualmin domain without mail feature: $AIO_DOMAIN"
+        aio_log "Creating Virtualmin domain: $AIO_DOMAIN"
         virtualmin create-domain \
             --domain "$AIO_DOMAIN" \
             --pass "$DOMAIN_PASSWORD" \
@@ -610,9 +574,15 @@ EOF
             --dir \
             --web \
             --ssl \
-            --no-features mail \
+            --acme-never \
             --skip-warnings \
             || aio_die "Virtualmin failed to create $AIO_DOMAIN."
+
+        aio_log "Disabling mail feature for $AIO_DOMAIN"
+        virtualmin disable-feature \
+            --domain "$AIO_DOMAIN" \
+            --mail \
+            || aio_die "Could not disable the mail feature for $AIO_DOMAIN."
     else
         aio_log "Skipping Virtualmin domain creation because it already exists."
     fi
@@ -675,9 +645,9 @@ EOF
     run_as_admin "$AIO_COMPOSE_DIR" docker compose -f docker-compose.yaml up -d \
         || aio_die "Failed to start Nextcloud AIO."
 
-    aio_log "Checking AIO administration interface (30 seconds)"
+    aio_log "Checking AIO administration interface (10 seconds)"
     AIO_READY=0
-    for i in $(seq 1 30); do
+    for i in $(seq 1 10); do
         if curl --silent --show-error --insecure --max-time 1 \
             "https://127.0.0.1:${AIO_ADMIN_PORT}/" >/dev/null 2>&1; then
             AIO_READY=1
@@ -735,7 +705,6 @@ EOF
         --domain "$AIO_DOMAIN" \
         --path "/" \
         --url "http://127.0.0.1:${AIO_WEB_PORT}/" \
-        --websockets \
         >"$PROXY_OUTPUT" 2>&1
     PROXY_EXIT_CODE=$?
     set -e
@@ -785,9 +754,6 @@ EOF
             || aio_die "Failed to add Apache directive: $directive"
     done
 
-    # Optional hardening Virtualmin's CLI has no flag for - see function def.
-    patch_proxypass_nocanon "$AIO_WEB_PORT"
-
     # -----------------------------------------------------------------------
     # Apache syntax test and reload
     # -----------------------------------------------------------------------
@@ -803,24 +769,6 @@ EOF
     systemctl reload apache2
 
     echo "✓ Apache reloaded successfully."
-
-    # -----------------------------------------------------------------------
-    # Verify Apache's loaded vhosts
-    # -----------------------------------------------------------------------
-    aio_log "Verifying Apache's loaded VirtualHost configuration"
-    apache2ctl -S 2>&1 | grep -i "$AIO_DOMAIN" \
-        || aio_die "Apache does not report the Nextcloud VirtualHost."
-
-    # -----------------------------------------------------------------------
-    # Ports and containers
-    # -----------------------------------------------------------------------
-    aio_log "Checking Nextcloud AIO ports"
-    ss -lntp 2>/dev/null | grep -E ":(${AIO_ADMIN_PORT}|${AIO_WEB_PORT})\b" || true
-
-    aio_log "Checking Nextcloud AIO containers as $sudo_user"
-    run_as_admin "$AIO_COMPOSE_DIR" docker ps \
-        --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
-        | grep -E 'nextcloud-aio|NAMES' || true
 
     echo
     echo "============================================================"
@@ -868,19 +816,7 @@ apt-get clean
 # ---------------------------------------------------------------------------
 # Final verification
 # ---------------------------------------------------------------------------
-log_step "Running final verification"
-
-if systemctl is-active --quiet docker; then
-    log_success "Docker: running"
-else
-    log_error "Docker: NOT running"
-fi
-
-if id -nG "$sudo_user" | tr ' ' '\n' | grep -qx "docker"; then
-    log_success "Docker group: '$sudo_user' is a member"
-else
-    log_error "Docker group: '$sudo_user' is NOT a member"
-fi
+log_step "Finalizing installation"
 
 log_step "Installation complete!"
 
