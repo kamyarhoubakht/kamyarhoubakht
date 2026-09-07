@@ -583,13 +583,6 @@ EOF
         containerd.io \
         docker-buildx-plugin \
         docker-compose-plugin
-        
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json <<EOF 
-{
-    "firewall-backend": "nftables"
-}
-EOF
 
     systemctl enable --now docker
 
@@ -938,19 +931,6 @@ EOF
 
 
         # -------------------------------------------------------------------
-        # Disable mail for the Nextcloud domain
-        # -------------------------------------------------------------------
-
-        aio_log "Disabling mail feature for $AIO_DOMAIN"
-
-        virtualmin disable-feature \
-            --domain "$AIO_DOMAIN" \
-            --mail \
-            || aio_die \
-                "Could not disable the mail feature for $AIO_DOMAIN."
-
-
-        # -------------------------------------------------------------------
         # Enable required Apache modules
         # -------------------------------------------------------------------
 
@@ -1007,6 +987,10 @@ services:
     image: ${AIO_IMAGE}
     container_name: nextcloud-aio-mastercontainer
     init: true
+    # Puts the container on the classic docker0 bridge instead of a
+    # Compose-generated network - avoids the "Could not resolve host:
+    # ghcr.io" failure some hosts hit with Compose's default network.
+    network_mode: bridge
     restart: always
 
     ports:
@@ -1116,6 +1100,7 @@ EOF
             --domain "$AIO_DOMAIN" \
             --path "/" \
             --url "http://127.0.0.1:${AIO_WEB_PORT}/" \
+            --websockets \
             >"$PROXY_OUTPUT" 2>&1
 
         PROXY_EXIT_CODE=$?
