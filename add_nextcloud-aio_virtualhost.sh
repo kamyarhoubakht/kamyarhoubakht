@@ -40,7 +40,7 @@ echo "============================================================"
 echo
 
 read -r -p "Enter the new domain/subdomain for Nextcloud: " AIO_DOMAIN
-AIO_DOMAIN="${AIO_DOMAIN,,}"
+AIO_DOMAIN="$(echo "$AIO_DOMAIN" | tr '[:upper:]' '[:lower:]')"
 
 [[ -n "$AIO_DOMAIN" ]] || {
     log_error "No domain was supplied."
