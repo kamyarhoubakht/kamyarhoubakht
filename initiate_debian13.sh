@@ -575,6 +575,58 @@ Architectures: $DOCKER_ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
+    # -----------------------------------------------------------------------
+    # Docker native nftables firewall backend
+    #
+    # Configure Docker BEFORE installing the Docker packages. This ensures
+    # that if the Docker package starts dockerd during installation, it
+    # already uses the native nftables firewall backend.
+    # -----------------------------------------------------------------------
+
+    log_step "Configuring Docker to use the native nftables firewall backend"
+
+    mkdir -p /etc/docker
+
+    cat > /etc/docker/daemon.json <<'EOF'
+{
+    "firewall-backend": "nftables"
+}
+EOF
+
+    log_success "Docker native nftables firewall backend configured."
+
+    # -----------------------------------------------------------------------
+    # IP forwarding
+    #
+    # Docker's native nftables backend does not enable IP forwarding itself.
+    # Enable it persistently for both IPv4 and IPv6.
+    # -----------------------------------------------------------------------
+
+    log_step "Enabling IP forwarding for Docker"
+
+    cat > /etc/sysctl.d/99-docker-forwarding.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+
+    sysctl --system >/dev/null
+
+    if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+        log_error "IPv4 forwarding could not be enabled."
+        exit 1
+    fi
+
+    if [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" != "1" ]]; then
+        log_error "IPv6 forwarding could not be enabled."
+        exit 1
+    fi
+
+    log_success "IPv4 and IPv6 forwarding enabled."
+
+    # -----------------------------------------------------------------------
+    # Install Docker
+    # -----------------------------------------------------------------------
+
     apt-get update
 
     apt-get install -y \
@@ -591,7 +643,7 @@ EOF
         exit 1
     fi
 
-    log_success "Docker installed and running."
+    log_success "Docker installed and running with native nftables firewall backend."
 
     mark_done "docker"
 
