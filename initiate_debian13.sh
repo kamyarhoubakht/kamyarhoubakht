@@ -1302,6 +1302,27 @@ else
 
 fi
 
+# ---------------------------------------------------------------------------
+# Final Docker networking initialization
+# ---------------------------------------------------------------------------
+
+log_step "Restarting Docker to finalize nftables networking"
+
+systemctl restart docker
+
+if ! systemctl is-active --quiet docker; then
+    log_error "Docker service failed after final restart."
+    exit 1
+fi
+
+DOCKER_FIREWALL_BACKEND="$(docker info --format '{{.FirewallBackend.Driver}}' 2>/dev/null || true)"
+
+if [[ "$DOCKER_FIREWALL_BACKEND" != "nftables" ]]; then
+    log_error "Docker firewall backend after final restart is '$DOCKER_FIREWALL_BACKEND', expected 'nftables'."
+    exit 1
+fi
+
+log_success "Docker restarted and nftables networking finalized."
 
 # ---------------------------------------------------------------------------
 # Cleanup
