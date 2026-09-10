@@ -495,6 +495,90 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# Step 4b: Virtualmin nftables — allow Docker bridge forwarding
+# ---------------------------------------------------------------------------
+#
+# Virtualmin's nftables module (Debian 13) installs an `inet` table with a
+# `forward` base chain, policy drop. Docker's experimental nftables backend
+# creates its own `docker-bridges` tables with their own base chains at the
+# same forward hook. In nftables, unlike iptables, an accept verdict in one
+# base chain is NOT final — the packet is still evaluated by every other
+# base chain registered at the hook, so Virtualmin's drop policy kills all
+# forwarded container traffic (NAT works, replies are dropped).
+#
+# The accept rules must therefore live inside Virtualmin's OWN stored
+# ruleset (/etc/webmin/nftables/rules.conf); a runtime `nft add` is flushed
+# the next time the module re-applies its configuration.
+# ---------------------------------------------------------------------------
+
+if ! step_done "firewall_docker_forward"; then
+
+    log_step "Configuring Virtualmin nftables firewall for Docker forwarding"
+
+    NFT_RULES_CONF="/etc/webmin/nftables/rules.conf"
+
+    # The Virtualmin postinstall creates the module's ruleset. Wait briefly
+    # in case postinstall is still finishing.
+    for _ in $(seq 1 12); do
+        [[ -f "$NFT_RULES_CONF" ]] && break
+        sleep 5
+    done
+
+    if [[ ! -f "$NFT_RULES_CONF" ]]; then
+        log_error "Virtualmin nftables ruleset not found at $NFT_RULES_CONF."
+        log_error "Add the following two rules to the 'forward' chain manually:"
+        log_error '    ct state established,related accept'
+        log_error '    iifname { "docker0", "br-*" } accept'
+        log_error "Re-run this script afterwards; this step is intentionally"
+        log_error "not marked complete so it will be retried."
+        # Intentionally NOT marking done.
+    elif grep -q 'iifname { "docker0", "br-*" } accept' "$NFT_RULES_CONF"; then
+        log_success "Docker forwarding rules already present in $NFT_RULES_CONF."
+        mark_done "firewall_docker_forward"
+    else
+        cp -a "$NFT_RULES_CONF" \
+            "${NFT_RULES_CONF}.pre-docker-$(date +%Y%m%d_%H%M%S)"
+
+        TAB="$(printf '\t')"
+
+        awk -v tab="$TAB" '
+            /chain forward[[:space:]]*\{/ {
+                print
+                print tab tab "ct state established,related accept"
+                print tab tab "iifname { \"docker0\", \"br-*\" } accept"
+                next
+            }
+            { print }
+        ' "$NFT_RULES_CONF" > "${NFT_RULES_CONF}.new"
+
+        if ! nft -c -f "${NFT_RULES_CONF}.new" 2>/dev/null; then
+            log_error "Modified nftables ruleset failed validation."
+            log_error "Original left untouched at $NFT_RULES_CONF."
+            rm -f "${NFT_RULES_CONF}.new"
+            exit 1
+        fi
+
+        mv "${NFT_RULES_CONF}.new" "$NFT_RULES_CONF"
+
+        # Apply the stored ruleset (the same thing the Webmin
+        # "Apply Configuration" button does).
+        if nft -f "$NFT_RULES_CONF" 2>/dev/null; then
+            log_success "Docker forwarding rules installed and applied."
+            mark_done "firewall_docker_forward"
+        else
+            log_error "Failed to apply $NFT_RULES_CONF."
+            log_error "Apply it manually from Webmin:"
+            log_error "Networking -> Linux Firewall (nftables) -> Apply Configuration."
+            # Intentionally NOT marking done so a re-run retries.
+        fi
+    fi
+
+else
+    log_success "Virtualmin nftables Docker forwarding already configured, skipping."
+fi
+
+
+# ---------------------------------------------------------------------------
 # Step 5: Administrator tools
 # ---------------------------------------------------------------------------
 
