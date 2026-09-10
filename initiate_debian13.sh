@@ -1245,6 +1245,7 @@ EOF
             --domain "$AIO_DOMAIN" \
             --path "/" \
             --url "http://127.0.0.1:${AIO_WEB_PORT}/" \
+            --websockets
             >"$PROXY_OUTPUT" 2>&1
 
         PROXY_EXIT_CODE=$?
