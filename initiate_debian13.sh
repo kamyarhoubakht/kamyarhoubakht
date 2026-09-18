@@ -493,6 +493,55 @@ else
 
 fi
 
+# ---------------------------------------------------------------------------
+# Step 4a: Tune default Virtualmin PHP-FPM template
+# ---------------------------------------------------------------------------
+#
+# Use PHP-FPM ondemand for newly-created virtual servers. This prevents
+# dozens of independent PHP-FPM pools from permanently retaining idle
+# workers on multi-site hosting servers.
+#
+# Leave web_phpchildren unchanged/disabled so Virtualmin continues to
+# calculate pm.max_children automatically.
+#
+# Additional PHP-FPM pool options are stored internally by Virtualmin as
+# tab-separated values. modify-template --value-file converts newlines
+# to tabs automatically.
+# ---------------------------------------------------------------------------
+
+if ! step_done "virtualmin_php_fpm_defaults"; then
+
+    log_step "Configuring Virtualmin Default Settings PHP-FPM defaults"
+
+    PHP_FPM_OPTIONS_FILE="$(mktemp)"
+
+    cat > "$PHP_FPM_OPTIONS_FILE" <<'EOF'
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+EOF
+
+    if virtualmin modify-template \
+        --name "Default Settings" \
+        --setting php_fpmtype --value "ondemand" \
+        --setting php_fpm --value-file "$PHP_FPM_OPTIONS_FILE"
+    then
+        rm -f "$PHP_FPM_OPTIONS_FILE"
+    else
+        rm -f "$PHP_FPM_OPTIONS_FILE"
+        log_error "Failed to configure PHP-FPM defaults in Virtualmin Default Settings template."
+        exit 1
+    fi
+
+    log_success "Virtualmin Default Settings configured for PHP-FPM ondemand."
+
+    mark_done "virtualmin_php_fpm_defaults"
+
+else
+
+    log_success "Virtualmin PHP-FPM defaults already configured, skipping."
+
+fi
+
 
 # ---------------------------------------------------------------------------
 # Step 4b: Virtualmin nftables — allow Docker bridge forwarding
