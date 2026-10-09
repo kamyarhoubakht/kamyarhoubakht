@@ -3,6 +3,10 @@ set -Eeuo pipefail
 [[ "${DEBUG:-}" == "true" ]] && set -x
 export DEBIAN_FRONTEND=noninteractive
 
+# Use the universally available C locale until en_US.UTF-8 is verified below.
+# SSH clients may otherwise pass LC_CTYPE=UTF-8, which Debian cannot use.
+export LANG=C LC_ALL=C LC_CTYPE=C
+
 LOG_FILE="/var/log/setup_script.log"
 STATE_FILE="/root/.setup_state"
 CURRENT_STAGE="Preflight"
@@ -324,18 +328,27 @@ log_success "Initial choices collected. Continuing without further prompts."
 # System Locales Configuration
 # ---------------------------------------------------------------------------
 
-if ! step_done "locale_fix"; then
+if ! step_done "locale_fix" || ! locale -a | grep -qi '^en_US\.utf8$'; then
     log_step "Generating en_US.UTF-8 locale to prevent Perl warnings"
 
-    apt-get update >/dev/null 2>&1 || true
-    apt-get install -y locales >/dev/null 2>&1 || true
+    apt-get update
+    apt-get install -y locales
 
     sed -i \
         's/^[#[:space:]]*en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
         /etc/locale.gen
 
+    if ! grep -qxF 'en_US.UTF-8 UTF-8' /etc/locale.gen; then
+        echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+    fi
+
     locale-gen en_US.UTF-8 >/dev/null 2>&1
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+    if ! locale -a | grep -qi '^en_US\.utf8$'; then
+        log_error "en_US.UTF-8 is still unavailable after locale generation."
+        exit 1
+    fi
 
     log_success "System locale generated and set to en_US.UTF-8."
     mark_done "locale_fix"
@@ -345,6 +358,7 @@ fi
 
 export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
+export LC_CTYPE="en_US.UTF-8"
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +567,7 @@ if ! step_done "virtualmin"; then
 
     sh -c "$(curl -fsSL https://download.virtualmin.com/virtualmin-install)" \
         -- \
+        --yes \
         --bundle "$stack_choice" \
         --hostname "$hostname"
 
@@ -1217,6 +1232,7 @@ EOF
             --setting web_cgimode --value "none" \
             --setting web_webmail --value 0 \
             --setting web_sslredirect --value 1 \
+            --setting ssl_auto_letsencrypt --value 0 \
             --setting mail_subject --value "" \
             || aio_die \
                 "Failed to configure Virtualmin 'Reverse Proxy' template."
@@ -1290,6 +1306,48 @@ EOF
             --mail \
             || aio_die \
                 "Could not disable the mail feature for $AIO_DOMAIN."
+
+
+        # -------------------------------------------------------------------
+        # Keep only the Nextcloud hostname, then request its SSL certificate
+        #
+        # The Reverse Proxy template disables automatic certificate requests
+        # during creation. Remove ALL ServerAlias directives from both the
+        # HTTP and HTTPS virtual hosts using Virtualmin's native API. This
+        # includes www, mail, admin and webmail names that have no DNS records.
+        # ServerName remains the selected AIO_DOMAIN.
+        # -------------------------------------------------------------------
+
+        aio_log "Removing extra Apache hostnames for $AIO_DOMAIN"
+
+        virtualmin modify-web \
+            --domain "$AIO_DOMAIN" \
+            --remove-directive "ServerAlias" \
+            || aio_die "Failed to remove extra Apache hostnames for $AIO_DOMAIN."
+
+        aio_log "Validating and reloading Apache before requesting SSL"
+
+        apache2ctl configtest \
+            || aio_die "Apache configuration is invalid before the SSL request."
+
+        systemctl reload apache2 \
+            || aio_die "Failed to reload Apache before the SSL request."
+
+        aio_log "Requesting Let's Encrypt SSL for $AIO_DOMAIN only"
+
+        # Explicit --host also stores this single hostname for renewal.
+        # Virtualmin handles the HTTP challenge and temporarily bypasses
+        # redirects that would otherwise prevent validation.
+        if ! virtualmin generate-letsencrypt-cert \
+            --domain "$AIO_DOMAIN" \
+            --host "$AIO_DOMAIN" \
+            --renew \
+            --web
+        then
+            aio_die "SSL request failed for $AIO_DOMAIN. Check public DNS and inbound port 80; see $AIO_LOG_FILE."
+        fi
+
+        log_success "Let's Encrypt certificate installed for $AIO_DOMAIN only; automatic renewal enabled."
 
 
         # -------------------------------------------------------------------
