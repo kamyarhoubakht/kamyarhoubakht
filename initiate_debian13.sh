@@ -5,13 +5,22 @@ export DEBIAN_FRONTEND=noninteractive
 
 LOG_FILE="/var/log/setup_script.log"
 STATE_FILE="/root/.setup_state"
+CURRENT_STAGE="Preflight"
+INSTALL_COMPLETE=0
+TEMP_DOCKER_NETWORK=""
+
+# Capture command output in the installation log as well as the terminal.
+# Keep it private because installation commands may print sensitive details.
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 touch "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
-log_step() { echo "🔄 $1" | tee -a "$LOG_FILE"; }
-log_success() { echo "✅ $1" | tee -a "$LOG_FILE"; }
-log_error() { echo "❌ $1" | tee -a "$LOG_FILE" >&2; }
+log_step() { CURRENT_STAGE="$1"; echo "🔄 $1"; }
+log_success() { echo "✅ $1"; }
+log_error() { echo "❌ $1" >&2; }
 
 handle_error() {
     local exit_code=$?
@@ -23,7 +32,25 @@ handle_error() {
     exit "$exit_code"
 }
 
-cleanup() { :; }
+cleanup() {
+    local exit_code=$?
+    trap - EXIT
+
+    # Clean up an interrupted temporary network test, if one was started.
+    if [[ -n "${TEMP_DOCKER_NETWORK:-}" ]] && command -v docker >/dev/null 2>&1; then
+        docker network rm "$TEMP_DOCKER_NETWORK" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        echo
+        log_error "INSTALLATION FAILED during: $CURRENT_STAGE (exit $exit_code)"
+        log_error "Review the log at $LOG_FILE and fix the error before re-running."
+    elif [[ "${INSTALL_COMPLETE:-0}" -ne 1 ]]; then
+        log_error "The installer exited without completing its final verification."
+        exit_code=1
+    fi
+    exit "$exit_code"
+}
 
 trap 'handle_error $LINENO' ERR
 trap cleanup EXIT
@@ -99,6 +126,199 @@ case "$ARCH" in
         ;;
 esac
 
+
+# ---------------------------------------------------------------------------
+# Collect all interactive answers BEFORE installation begins
+# ---------------------------------------------------------------------------
+log_step "Collecting all installation choices"
+
+if step_done "admin_user"; then
+    sudo_user="$(cat /root/.virtualmin_admin_user)"
+else
+    read -rp "Enter administrator username (default: goodmin): " sudo_user
+    sudo_user="${sudo_user:-goodmin}"
+
+    if ! [[ "$sudo_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || [[ "$sudo_user" == "root" ]]; then
+        log_error "Invalid administrator username: $sudo_user"
+        exit 1
+    fi
+
+    echo
+    echo "============================================================"
+    echo " Administrator password"
+    echo "============================================================"
+    echo
+    while true; do
+        read -rsp "Password: " sudo_user_password
+        echo
+        if [[ ${#sudo_user_password} -lt 12 ]]; then
+            echo "Password must contain at least 12 characters."
+            continue
+        fi
+        read -rsp "Confirm password: " sudo_user_password_confirm
+        echo
+        if [[ "$sudo_user_password" != "$sudo_user_password_confirm" ]]; then
+            echo "Passwords do not match. Please try again."
+            continue
+        fi
+        break
+    done
+    unset sudo_user_password_confirm
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2: Select Virtualmin stack
+# ---------------------------------------------------------------------------
+
+if ! step_done "stack_selected"; then
+
+    while true; do
+
+        read -rp \
+            "Install LAMP (Apache) or LEMP (Nginx)? (LAMP/LEMP): " \
+            stack_choice
+
+        stack_choice="$(echo "$stack_choice" | tr '[:lower:]' '[:upper:]')"
+
+        if [[ "$stack_choice" == "LAMP" || "$stack_choice" == "LEMP" ]]; then
+            break
+        fi
+
+        echo "Please enter LAMP or LEMP."
+
+    done
+
+    echo "$stack_choice" > /root/.virtualmin_stack
+
+    log_success "Selected Virtualmin stack: $stack_choice"
+
+    mark_done "stack_selected"
+
+else
+
+    stack_choice="$(cat /root/.virtualmin_stack)"
+
+    log_success "Using previously selected stack: $stack_choice"
+
+fi
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Nextcloud AIO decision
+# ---------------------------------------------------------------------------
+
+if [[ -f /root/.nextcloud_choice ]]; then
+
+    install_nc="$(cat /root/.nextcloud_choice)"
+
+else
+
+    while true; do
+        read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
+        install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$install_nc" == "y" && "$stack_choice" == "LEMP" ]]; then
+            echo "Nextcloud AIO requires LAMP. Choose n with LEMP."
+            continue
+        fi
+        [[ "$install_nc" == "y" || "$install_nc" == "n" ]] && break
+        echo "Please enter y or n."
+    done
+
+    echo "$install_nc" > /root/.nextcloud_choice
+
+fi
+
+
+if [[ "$install_nc" =~ ^y$ ]]; then
+
+    if [[ "$stack_choice" != "LAMP" ]]; then
+
+        log_error \
+            "Nextcloud AIO integration requires the LAMP/Apache Virtualmin stack."
+
+        log_error \
+            "Re-run this bootstrap and choose LAMP if you want the integrated AIO reverse proxy,"
+
+        log_error \
+            "or answer 'n' to the Nextcloud AIO question if you want to keep LEMP."
+
+        exit 1
+    fi
+
+    log_success \
+        "Nextcloud AIO selected; will be installed after Docker/Portainer are ready."
+
+else
+
+    log_success "NextCloud-AIO not selected."
+
+fi
+
+
+# Do not silently treat an invalid answer as 'no'.
+if [[ "$install_nc" != "y" && "$install_nc" != "n" ]]; then
+    log_error "Invalid saved Nextcloud selection '$install_nc'; expected y or n."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Nextcloud domain is collected now, not during Step 8.
+# ---------------------------------------------------------------------------
+valid_domain() {
+    local name="$1" part
+    local -a labels
+    [[ ${#name} -le 253 && "$name" == *.* && "$name" != *..* ]] || return 1
+    [[ "$name" =~ ^[a-z0-9.-]+$ && "$name" != .* && "$name" != *. ]] || return 1
+    IFS='.' read -r -a labels <<< "$name"
+    for part in "${labels[@]}"; do
+        [[ "$part" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+    done
+}
+
+if [[ "$install_nc" == "y" ]]; then
+    if [[ -s /root/.nextcloud_domain ]]; then
+        AIO_DOMAIN="$(cat /root/.nextcloud_domain)"
+    else
+        echo
+        echo "Enter the independent Nextcloud domain/subdomain."
+        echo "DNS must point to this server before completing AIO setup."
+        read -rp "Nextcloud domain: " AIO_DOMAIN
+        AIO_DOMAIN="${AIO_DOMAIN,,}"
+        valid_domain "$AIO_DOMAIN" || { log_error "Invalid Nextcloud domain: $AIO_DOMAIN"; exit 1; }
+        printf '%s\n' "$AIO_DOMAIN" > /root/.nextcloud_domain
+        chmod 600 /root/.nextcloud_domain
+    fi
+    valid_domain "$AIO_DOMAIN" || { log_error "Invalid stored Nextcloud domain: $AIO_DOMAIN"; exit 1; }
+else
+    AIO_DOMAIN=""
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3: Hostname (ask now, apply after administrator setup)
+# ---------------------------------------------------------------------------
+if step_done "hostname" || [[ -s /root/.virtualmin_hostname ]]; then
+    hostname="$(cat /root/.virtualmin_hostname)"
+    log_success "Using selected hostname: $hostname"
+else
+    CURRENT_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
+    echo
+    echo "Virtualmin requires a proper fully qualified hostname."
+    echo "Example: server.example.com"
+    echo
+    read -rp "Enter hostname [$CURRENT_HOSTNAME]: " hostname
+    hostname="${hostname:-$CURRENT_HOSTNAME}"
+    hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
+    valid_domain "$hostname" || { log_error "Invalid hostname: $hostname"; exit 1; }
+    printf '%s\n' "$hostname" > /root/.virtualmin_hostname
+    chmod 600 /root/.virtualmin_hostname
+fi
+valid_domain "$hostname" || { log_error "Invalid stored hostname: $hostname"; exit 1; }
+if [[ "$install_nc" == "y" && "$AIO_DOMAIN" == "$hostname" ]]; then
+    log_error "Nextcloud domain must differ from the server hostname."
+    exit 1
+fi
+
+log_success "Initial choices collected. Continuing without further prompts."
 
 # ---------------------------------------------------------------------------
 # System Locales Configuration
@@ -177,18 +397,7 @@ log_success "Root SSH authorized_keys found."
 
 if ! step_done "admin_user"; then
 
-    read -rp "Enter administrator username (default: goodmin): " sudo_user
-    sudo_user="${sudo_user:-goodmin}"
-
-    if ! [[ "$sudo_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        log_error "Invalid username: $sudo_user"
-        exit 1
-    fi
-
-    if [[ "$sudo_user" == "root" ]]; then
-        log_error "The administrator username cannot be root."
-        exit 1
-    fi
+    log_success "Using administrator username selected at startup: $sudo_user"
 
     echo "$sudo_user" > /root/.virtualmin_admin_user
     chmod 600 /root/.virtualmin_admin_user
@@ -201,33 +410,11 @@ if ! step_done "admin_user"; then
         log_success "User '$sudo_user' created."
     fi
 
-    echo
-    echo "============================================================"
-    echo " Administrator password"
-    echo "============================================================"
-    echo
-    echo "Create a password for '$sudo_user'."
-    echo
-
-    while true; do
-        read -rsp "Password: " sudo_user_password
-        echo
-
-        if [[ ${#sudo_user_password} -lt 12 ]]; then
-            echo "Password must contain at least 12 characters."
-            continue
-        fi
-
-        read -rsp "Confirm password: " sudo_user_password_confirm
-        echo
-
-        if [[ "$sudo_user_password" != "$sudo_user_password_confirm" ]]; then
-            echo "Passwords do not match. Please try again."
-            continue
-        fi
-
-        break
-    done
+    # Password was entered once, during initial configuration.
+    [[ -n "${sudo_user_password:-}" ]] || {
+        log_error "Missing administrator password from initial configuration."
+        exit 1
+    }
 
     printf '%s:%s\n' "$sudo_user" "$sudo_user_password" | chpasswd
 
@@ -278,8 +465,8 @@ if [[ -z "${sudo_user:-}" ]]; then
     if [[ -f /root/.virtualmin_admin_user ]]; then
         sudo_user="$(cat /root/.virtualmin_admin_user)"
     else
-        read -rp "Enter administrator username (default: goodmin): " sudo_user
-        sudo_user="${sudo_user:-goodmin}"
+        log_error "Administrator username state is missing; re-run the installer."
+        exit 1
     fi
 
 fi
@@ -335,129 +522,15 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Select Virtualmin stack
+# Step 2/3: Values were collected before installation began.
 # ---------------------------------------------------------------------------
-
-if ! step_done "stack_selected"; then
-
-    while true; do
-
-        read -rp \
-            "Install LAMP (Apache) or LEMP (Nginx)? (LAMP/LEMP): " \
-            stack_choice
-
-        stack_choice="$(echo "$stack_choice" | tr '[:lower:]' '[:upper:]')"
-
-        if [[ "$stack_choice" == "LAMP" || "$stack_choice" == "LEMP" ]]; then
-            break
-        fi
-
-        echo "Please enter LAMP or LEMP."
-
-    done
-
-    echo "$stack_choice" > /root/.virtualmin_stack
-
-    log_success "Selected Virtualmin stack: $stack_choice"
-
-    mark_done "stack_selected"
-
-else
-
-    stack_choice="$(cat /root/.virtualmin_stack)"
-
-    log_success "Using previously selected stack: $stack_choice"
-
-fi
-
-
-# ---------------------------------------------------------------------------
-# Step 2b: Nextcloud AIO decision
-# ---------------------------------------------------------------------------
-
-if [[ -f /root/.nextcloud_choice ]]; then
-
-    install_nc="$(cat /root/.nextcloud_choice)"
-
-else
-
-    read -rp "Do you want to install NextCloud-AIO? (y/n): " install_nc
-
-    install_nc="$(echo "$install_nc" | tr '[:upper:]' '[:lower:]')"
-
-    echo "$install_nc" > /root/.nextcloud_choice
-
-fi
-
-
-if [[ "$install_nc" =~ ^y$ ]]; then
-
-    if [[ "$stack_choice" != "LAMP" ]]; then
-
-        log_error \
-            "Nextcloud AIO integration requires the LAMP/Apache Virtualmin stack."
-
-        log_error \
-            "Re-run this bootstrap and choose LAMP if you want the integrated AIO reverse proxy,"
-
-        log_error \
-            "or answer 'n' to the Nextcloud AIO question if you want to keep LEMP."
-
-        exit 1
-    fi
-
-    log_success \
-        "Nextcloud AIO selected; will be installed after Docker/Portainer are ready."
-
-else
-
-    log_success "NextCloud-AIO not selected."
-
-fi
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Hostname
-# ---------------------------------------------------------------------------
-
 if ! step_done "hostname"; then
-
-    CURRENT_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
-
-    echo
-    echo "Virtualmin requires a proper fully qualified hostname."
-    echo "Example: server.example.com"
-    echo
-
-    read -rp "Enter hostname [$CURRENT_HOSTNAME]: " hostname
-
-    hostname="${hostname:-$CURRENT_HOSTNAME}"
-    hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
-
-    if ! [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
-
-        log_error "Invalid hostname: $hostname"
-        log_error "Use a fully qualified hostname such as server.example.com"
-
-        exit 1
-    fi
-
+    log_step "Applying the selected server hostname"
     hostnamectl set-hostname "$hostname"
-
-    echo "$hostname" > /root/.virtualmin_hostname
-
-    log_success "Hostname set to $hostname"
-
     mark_done "hostname"
-
 else
-
-    hostname="$(cat /root/.virtualmin_hostname)"
-
     log_success "Using existing hostname: $hostname"
-
 fi
-
 
 # ---------------------------------------------------------------------------
 # Step 4: Virtualmin installation
@@ -544,85 +617,166 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# Step 4b: Virtualmin nftables — allow Docker bridge forwarding
+# Step 4b: Webmin nftables — allow Docker bridge forwarding
 # ---------------------------------------------------------------------------
+# Webmin 2.670+ manages the native system nftables configuration, normally
+# /etc/nftables.conf. Its host firewall may have a forward base chain whose
+# policy is drop. Docker's independent nftables base chains cannot override
+# that drop, so Docker bridge packets must also be accepted in THIS chain.
 #
-# Virtualmin's nftables module (Debian 13) installs an `inet` table with a
-# `forward` base chain, policy drop. Docker's experimental nftables backend
-# creates its own `docker-bridges` tables with their own base chains at the
-# same forward hook. In nftables, unlike iptables, an accept verdict in one
-# base chain is NOT final — the packet is still evaluated by every other
-# base chain registered at the hook, so Virtualmin's drop policy kills all
-# forwarded container traffic (NAT works, replies are dropped).
-#
-# The accept rules must therefore live inside Virtualmin's OWN stored
-# ruleset (/etc/webmin/nftables/rules.conf); a runtime `nft add` is flushed
-# the next time the module re-applies its configuration.
+# The saved rules are modified atomically after nft syntax validation.
+# Live rules are inserted individually so we never flush Docker's tables.
+# Never modify Docker's own docker-bridges tables.
 # ---------------------------------------------------------------------------
 
 if ! step_done "firewall_docker_forward"; then
 
-    log_step "Configuring Virtualmin nftables firewall for Docker forwarding"
+    log_step "Configuring persistent Webmin nftables forwarding for Docker"
 
-    NFT_RULES_CONF="/etc/webmin/nftables/rules.conf"
-
-    # The Virtualmin postinstall creates the module's ruleset. Wait briefly
-    # in case postinstall is still finishing.
-    for _ in $(seq 1 12); do
-        [[ -f "$NFT_RULES_CONF" ]] && break
-        sleep 5
-    done
-
+    NFT_RULES_CONF="/etc/nftables.conf"
     if [[ ! -f "$NFT_RULES_CONF" ]]; then
-        log_error "Virtualmin nftables ruleset not found at $NFT_RULES_CONF."
-        log_error "Add the following two rules to the 'forward' chain manually:"
-        log_error '    ct state established,related accept'
-        log_error '    iifname { "docker0", "br-*" } accept'
-        log_error "Re-run this script afterwards; this step is intentionally"
-        log_error "not marked complete so it will be retried."
-        # Intentionally NOT marking done.
-    elif grep -q 'iifname { "docker0", "br-*" } accept' "$NFT_RULES_CONF"; then
-        log_success "Docker forwarding rules already present in $NFT_RULES_CONF."
-        mark_done "firewall_docker_forward"
-    else
-        cp -a "$NFT_RULES_CONF" \
-            "${NFT_RULES_CONF}.pre-docker-$(date +%Y%m%d_%H%M%S)"
-
-        TAB="$(printf '\t')"
-
-        awk -v tab="$TAB" '
-            /chain forward[[:space:]]*\{/ {
-                print
-                print tab tab "ct state established,related accept"
-                print tab tab "iifname { \"docker0\", \"br-*\" } accept"
-                next
-            }
-            { print }
-        ' "$NFT_RULES_CONF" > "${NFT_RULES_CONF}.new"
-
-        if ! nft -c -f "${NFT_RULES_CONF}.new" 2>/dev/null; then
-            log_error "Modified nftables ruleset failed validation."
-            log_error "Original left untouched at $NFT_RULES_CONF."
-            rm -f "${NFT_RULES_CONF}.new"
-            exit 1
-        fi
-
-        mv "${NFT_RULES_CONF}.new" "$NFT_RULES_CONF"
-
-        # Apply the stored ruleset (the same thing the Webmin
-        # "Apply Configuration" button does).
-        if nft -f "$NFT_RULES_CONF" 2>/dev/null; then
-            log_success "Docker forwarding rules installed and applied."
-            mark_done "firewall_docker_forward"
-        else
-            log_error "Failed to apply $NFT_RULES_CONF."
-            log_error "Apply it manually from Webmin:"
-            log_error "Networking -> Linux Firewall (nftables) -> Apply Configuration."
-            # Intentionally NOT marking done so a re-run retries.
-        fi
+        log_error "Webmin system nftables file not found: $NFT_RULES_CONF"
+        log_error "Inspect Webmin -> Networking -> Linux Firewall (nftables) -> Edit Config Files."
+        log_error "The installer will not guess a firewall configuration."
+        exit 1
     fi
 
+    # This patch intentionally expects one recognizable, system-managed
+    # 'inet' forward chain with policy drop in /etc/nftables.conf.
+    # Included-file or significantly different layouts stop safely.
+    NFT_METADATA="$(mktemp)"
+    NFT_CANDIDATE="$(mktemp /etc/.nftables-docker-XXXXXXXX)"
+
+    if ! awk -v meta="$NFT_METADATA" '
+        { source[NR] = $0 }
+        /^[[:space:]]*table[[:space:]]+[a-zA-Z0-9_-]+[[:space:]]+[a-zA-Z0-9_-]+[[:space:]]*\{/ {
+            in_table = ($2 == "inet")
+            table_name = in_table ? $3 : ""
+        }
+        in_table && /^[[:space:]]*chain[[:space:]]+forward[[:space:]]*\{/ {
+            in_chain = 1
+            chain_start = NR
+            hook = 0
+            drop = 0
+            policy_line = 0
+        }
+        in_chain {
+            if ($0 ~ /hook[[:space:]]+forward([[:space:];]|$)/) hook = 1
+            if ($0 ~ /policy[[:space:]]+drop([[:space:];]|$)/) {
+                drop = 1
+                policy_line = NR
+            }
+            if (NR > chain_start && $0 ~ /^[[:space:]]*\}[[:space:]]*;?[[:space:]]*$/) {
+                if (hook && drop) {
+                    count++
+                    chosen_table = table_name
+                    insertion_line = policy_line
+                    chosen_start = chain_start
+                    chosen_end = NR
+                }
+                in_chain = 0
+            }
+        }
+        END {
+            if (count != 1) {
+                printf "Expected one inet forward/drop chain; found %d.\n", count > "/dev/stderr"
+                exit 1
+            }
+            print chosen_table > meta
+            marker = "# Docker bridge forwarding (initiate_debian13.sh)"
+            found = 0
+            marker_found = 0
+            for (i = chosen_start; i <= chosen_end; i++) {
+                if (index(source[i], marker)) marker_found = 1
+                if (index(source[i], "iifname \"docker0\" accept")) found++
+                if (index(source[i], "iifname \"br-*\" accept")) found++
+                if (index(source[i], "oifname \"docker0\" accept")) found++
+                if (index(source[i], "oifname \"br-*\" accept")) found++
+            }
+            if (found == 4) {
+                exists = 1
+            }
+            else if (found != 0 || marker_found) {
+                print "Incomplete Docker forwarding block; refusing to guess." > "/dev/stderr"
+                exit 1
+            }
+            for (i = 1; i <= NR; i++) {
+                print source[i]
+                if (i == insertion_line && !exists) {
+                    print "        " marker
+                    print "        iifname \"docker0\" accept"
+                    print "        iifname \"br-*\" accept"
+                    print "        oifname \"docker0\" accept"
+                    print "        oifname \"br-*\" accept"
+                }
+            }
+        }
+    ' "$NFT_RULES_CONF" > "$NFT_CANDIDATE"; then
+        rm -f "$NFT_METADATA" "$NFT_CANDIDATE"
+        log_error "Could not safely identify the Webmin-managed forward/drop chain."
+        log_error "No firewall configuration was changed. Inspect $NFT_RULES_CONF."
+        exit 1
+    fi
+
+    NFT_TABLE="$(cat "$NFT_METADATA")"
+    rm -f "$NFT_METADATA"
+
+    if ! nft -c -f "$NFT_CANDIDATE"; then
+        rm -f "$NFT_CANDIDATE"
+        log_error "Candidate nftables configuration failed syntax validation; original untouched."
+        exit 1
+    fi
+
+    # Also verify the exact chain already exists in the running ruleset.
+    # Do not attempt to activate an unexpected or incomplete firewall profile.
+    if ! nft list chain inet "$NFT_TABLE" forward | grep -Eq 'policy[[:space:]]+drop'; then
+        rm -f "$NFT_CANDIDATE"
+        log_error "Expected active inet $NFT_TABLE forward chain with policy drop."
+        log_error "Apply the Virtualmin hosting firewall profile before running this installer."
+        exit 1
+    fi
+
+    if ! cmp -s "$NFT_RULES_CONF" "$NFT_CANDIDATE"; then
+        cp -a "$NFT_RULES_CONF" "${NFT_RULES_CONF}.pre-docker-$(date +%Y%m%d_%H%M%S)"
+        chmod --reference="$NFT_RULES_CONF" "$NFT_CANDIDATE"
+        chown --reference="$NFT_RULES_CONF" "$NFT_CANDIDATE"
+        mv "$NFT_CANDIDATE" "$NFT_RULES_CONF"
+        log_success "Persistent Docker forwarding rules saved in $NFT_RULES_CONF."
+    else
+        rm -f "$NFT_CANDIDATE"
+        log_success "Persistent Docker forwarding rules already present."
+    fi
+
+    # Apply ONLY missing Docker bridge exceptions to the active chain.
+    # This does not flush any rulesets and does not touch Docker-owned tables.
+    for expression in \
+        'iifname "docker0" accept' \
+        'iifname "br-*" accept' \
+        'oifname "docker0" accept' \
+        'oifname "br-*" accept'
+    do
+        if ! nft list chain inet "$NFT_TABLE" forward | grep -Fq "$expression"; then
+            printf 'insert rule inet %s forward %s\n' "$NFT_TABLE" "$expression" | nft -f -
+        fi
+    done
+
+    for expression in \
+        'iifname "docker0" accept' \
+        'iifname "br-*" accept' \
+        'oifname "docker0" accept' \
+        'oifname "br-*" accept'
+    do
+        if ! nft list chain inet "$NFT_TABLE" forward | grep -Fq "$expression"; then
+            log_error "Live nftables exception not present: $expression"
+            exit 1
+        fi
+    done
+
+    log_success "Webmin forwarding chain allows Docker bridges in both directions."
+    mark_done "firewall_docker_forward"
+
 else
+
     log_success "Virtualmin nftables Docker forwarding already configured, skipping."
 fi
 
@@ -769,6 +923,13 @@ EOF
         docker-buildx-plugin \
         docker-compose-plugin
 
+    # Native nftables requires Docker Engine 29 or newer.
+    DOCKER_VERSION="$(docker --version | awk '{print $3}' | tr -d ',')"
+    if ! dpkg --compare-versions "$DOCKER_VERSION" ge "29.0.0"; then
+        log_error "Docker Engine $DOCKER_VERSION does not support native nftables (requires 29+)."
+        exit 1
+    fi
+
     systemctl enable --now docker
 
     if ! systemctl is-active --quiet docker; then
@@ -786,6 +947,33 @@ else
 
 fi
 
+
+# ---------------------------------------------------------------------------
+# Functional networking tests: default and user-created Docker bridge.
+# The HTTPS request exercises DNS, forwarding, and NAT together.
+# ---------------------------------------------------------------------------
+test_docker_networking() {
+    log_step "Testing Docker DNS and HTTPS through both bridge networks"
+    local test_image="curlimages/curl:latest"
+    local network_name="initiate-docker-test-$$"
+
+    docker pull "$test_image" >/dev/null
+    docker run --rm --network bridge "$test_image" \
+        --fail --silent --show-error --location --retry 2 \
+        --max-time 30 https://example.com/ >/dev/null
+    log_success "Docker default bridge: DNS and HTTPS passed."
+
+    docker network create --driver bridge "$network_name" >/dev/null
+    TEMP_DOCKER_NETWORK="$network_name"
+    docker run --rm --network "$network_name" "$test_image" \
+        --fail --silent --show-error --location --retry 2 \
+        --max-time 30 https://example.com/ >/dev/null
+    docker network rm "$network_name" >/dev/null
+    TEMP_DOCKER_NETWORK=""
+    log_success "Docker user-created bridge: DNS and HTTPS passed."
+}
+
+test_docker_networking
 
 # ---------------------------------------------------------------------------
 # Add administrator to Docker group
@@ -967,32 +1155,8 @@ if [[ "$install_nc" =~ ^y$ ]]; then
         aio_log "Starting Nextcloud AIO installation"
 
 
-        # -------------------------------------------------------------------
-        # Ask for Nextcloud domain
-        # -------------------------------------------------------------------
-
-        echo
-        echo "============================================================"
-        echo "Nextcloud AIO domain"
-        echo "============================================================"
-        echo
-
-        echo "Enter the independent domain/subdomain that will be used"
-        echo "for Nextcloud. DNS for this domain must already point at this"
-        echo "server's public IP before continuing."
-
-        echo
-
-        read -r -p "Nextcloud domain: " AIO_DOMAIN
-
-        AIO_DOMAIN="${AIO_DOMAIN,,}"
-
-        [[ -n "$AIO_DOMAIN" ]] || \
-            aio_die "No domain was supplied."
-
-        if ! [[ "$AIO_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-            aio_die "Invalid domain name: $AIO_DOMAIN"
-        fi
+        # Domain was collected and validated before installation began.
+        [[ -n "$AIO_DOMAIN" ]] || aio_die "Missing Nextcloud domain from startup configuration."
 
         aio_log "Nextcloud domain: $AIO_DOMAIN"
 
@@ -1188,7 +1352,7 @@ services:
     restart: always
 
     ports:
-      - "${AIO_ADMIN_PORT}:8080"
+      - "127.0.0.1:${AIO_ADMIN_PORT}:8080"
 
     volumes:
       - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
@@ -1394,7 +1558,7 @@ EOF
         echo
 
         echo "AIO administration interface:"
-        echo "  https://SERVER-IP:${AIO_ADMIN_PORT}"
+        echo "  https://127.0.0.1:${AIO_ADMIN_PORT} (via SSH tunnel)"
 
         echo
 
@@ -1458,6 +1622,36 @@ fi
 
 log_success "Docker restarted and nftables networking finalized."
 
+test_docker_networking
+
+# Check the locally bound administrator services. Allow for container startup.
+log_step "Verifying local administration services"
+for i in $(seq 1 30); do
+    if curl -kfsS --max-time 3 https://127.0.0.1:9443/ >/dev/null 2>&1; then
+        break
+    fi
+    if [[ "$i" -eq 30 ]]; then
+        log_error "Portainer HTTPS interface is not responding on localhost:9443."
+        exit 1
+    fi
+    sleep 2
+done
+log_success "Portainer local HTTPS interface responds."
+
+if [[ "$install_nc" == "y" ]]; then
+    for i in $(seq 1 30); do
+        if curl -kfsS --max-time 3 https://127.0.0.1:8080/ >/dev/null 2>&1; then
+            break
+        fi
+        if [[ "$i" -eq 30 ]]; then
+            log_error "Nextcloud AIO admin interface is not responding on localhost:8080."
+            exit 1
+        fi
+        sleep 2
+    done
+    log_success "Nextcloud AIO local HTTPS interface responds (web setup still required)."
+fi
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
@@ -1505,14 +1699,14 @@ echo "Portainer        : https://127.0.0.1:9443"
 
 echo "  (bound to localhost - reach it via an SSH tunnel, e.g.:"
 
-echo "   ssh -L 9443:127.0.0.1:9443 $sudo_user@$hostname)"
+echo "   ssh -N -L 9443:127.0.0.1:9443 -L 8080:127.0.0.1:8080 $sudo_user@$hostname)"
 
 if [[ "$install_nc" =~ ^y$ ]]; then
 
     echo
     echo "NextCloud AIO:"
-    echo "AIO setup interface: https://SERVER-IP:8080"
-    echo "Nextcloud: https://<your-AIO-domain>"
+    echo "AIO setup interface: https://127.0.0.1:8080 (SSH tunnel)"
+    echo "Nextcloud: https://$AIO_DOMAIN"
 
 fi
 
@@ -1535,4 +1729,6 @@ echo "  $STATE_FILE"
 
 echo
 
-echo "Installation completed successfully."
+INSTALL_COMPLETE=1
+echo "Installation completed successfully; required local connectivity tests passed."
+echo "Nextcloud AIO, if selected, still needs to be completed in its admin interface."
