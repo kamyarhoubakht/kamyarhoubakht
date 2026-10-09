@@ -12,6 +12,7 @@ STATE_FILE="/root/.setup_state"
 CURRENT_STAGE="Preflight"
 INSTALL_COMPLETE=0
 TEMP_DOCKER_NETWORK=""
+AIO_SSL_STATUS="not checked (AIO installation skipped)"
 
 # Capture command output in the installation log as well as the terminal.
 # Keep it private because installation commands may print sensitive details.
@@ -1338,16 +1339,22 @@ EOF
         # Explicit --host also stores this single hostname for renewal.
         # Virtualmin handles the HTTP challenge and temporarily bypasses
         # redirects that would otherwise prevent validation.
-        if ! virtualmin generate-letsencrypt-cert \
+        if virtualmin generate-letsencrypt-cert \
             --domain "$AIO_DOMAIN" \
             --host "$AIO_DOMAIN" \
             --renew \
             --web
         then
-            aio_die "SSL request failed for $AIO_DOMAIN. Check public DNS and inbound port 80; see $AIO_LOG_FILE."
+            AIO_SSL_STATUS="Let's Encrypt installed; automatic renewal enabled"
+            log_success "Let's Encrypt certificate installed for $AIO_DOMAIN only; automatic renewal enabled."
+        else
+            # A failed challenge does not replace the initial certificate.
+            # Continue installing AIO with the certificate created by Virtualmin.
+            AIO_SSL_STATUS="WARNING: Let's Encrypt failed; initial self-signed certificate retained"
+            aio_warn "SSL request failed for $AIO_DOMAIN; continuing with the initial self-signed certificate."
+            aio_warn "Check public DNS and inbound TCP port 80, then retry SSL in Virtualmin."
+            aio_warn "Certificate failure details: $AIO_LOG_FILE and /var/log/letsencrypt/letsencrypt.log"
         fi
-
-        log_success "Let's Encrypt certificate installed for $AIO_DOMAIN only; automatic renewal enabled."
 
 
         # -------------------------------------------------------------------
@@ -1765,6 +1772,7 @@ if [[ "$install_nc" =~ ^y$ ]]; then
     echo "NextCloud AIO:"
     echo "AIO setup interface: https://127.0.0.1:8080 (SSH tunnel)"
     echo "Nextcloud: https://$AIO_DOMAIN"
+    echo "Nextcloud SSL: $AIO_SSL_STATUS"
 
 fi
 
@@ -1788,5 +1796,10 @@ echo "  $STATE_FILE"
 echo
 
 INSTALL_COMPLETE=1
-echo "Installation completed successfully; required local connectivity tests passed."
+if [[ "$AIO_SSL_STATUS" == WARNING:* ]]; then
+    echo "Installation completed with an SSL warning; required local connectivity tests passed."
+    echo "$AIO_SSL_STATUS"
+else
+    echo "Installation completed successfully; required local connectivity tests passed."
+fi
 echo "Nextcloud AIO, if selected, still needs to be completed in its admin interface."
