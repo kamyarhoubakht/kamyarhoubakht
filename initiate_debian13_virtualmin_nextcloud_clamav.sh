@@ -1559,32 +1559,16 @@ EOF
 
         aio_log "Adding Nextcloud AIO Apache directives"
 
-        NATIVE_DIRECTIVES=(
-            "ProxyPreserveHost On"
-            "AllowEncodedSlashes NoDecode"
-            "H2WindowSize 5242880"
-            "TraceEnable off"
-            "LimitRequestBody 0"
-            "Timeout 3610"
-            "ProxyTimeout 3610"
-        )
-
-        for directive in "${NATIVE_DIRECTIVES[@]}"; do
-
-            aio_log "Setting Apache directive: $directive"
-
-            virtualmin modify-web \
-                --domain "$AIO_DOMAIN" \
-                --remove-directive "$directive" \
-                >/dev/null 2>&1 || true
-
-            virtualmin modify-web \
-                --domain "$AIO_DOMAIN" \
-                --add-directive "$directive" \
-                || aio_die \
-                    "Failed to add Apache directive: $directive"
-
-        done
+        virtualmin modify-web \
+            --domain "$AIO_DOMAIN" \
+            --add-directive "ProxyPreserveHost On" \
+            --add-directive "AllowEncodedSlashes NoDecode" \
+            --add-directive "H2WindowSize 5242880" \
+            --add-directive "TraceEnable off" \
+            --add-directive "LimitRequestBody 0" \
+            --add-directive "Timeout 3610" \
+            --add-directive "ProxyTimeout 3610" \
+            || aio_die "Failed to add Nextcloud AIO Apache directives"
 
 
         # -------------------------------------------------------------------
