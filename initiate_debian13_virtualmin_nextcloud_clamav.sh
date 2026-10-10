@@ -1974,3 +1974,599 @@ else
     echo "Installation completed successfully; required local connectivity tests passed."
 fi
 echo "Nextcloud AIO, if selected, still needs to be completed in its admin interface."
+
+# =============================================================================
+# Optional final stage: ClamAV unofficial sources + Maldet on Debian 13
+# =============================================================================
+# The original initialization above is preserved verbatim. This stage runs ONLY
+# after the required setup has completed (INSTALL_COMPLETE=1). Its failures do
+# NOT change the outcome of the main initializer.
+#
+# This addon never manages Virtualmin, Fail2ban, nftables, Docker, Postfix,
+# Cloudflare or the existing Maldet quarantine / cleaning policies.
+# Installed addon remains callable separately for recovery:
+#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --install
+#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --status
+#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --verify
+#
+# Addon state: /var/lib/virtualmin-clamav-maldet-setup/
+# Addon log:   /var/log/virtualmin-clamav-maldet-setup.log
+# =============================================================================
+
+SEC_ADDON_SCRIPT='/usr/local/sbin/virtualmin-clamav-maldet-addon.sh'
+SEC_ADDON_STEP='clamav_maldet_addon'
+SEC_ADDON_STATE='/var/lib/virtualmin-clamav-maldet-setup'
+
+install_security_addon_script() {
+    local tmp=''
+    if ! install -d -m 0755 /usr/local/sbin; then
+        echo 'WARNING: Cannot prepare /usr/local/sbin for optional security addon.' >&2
+        return 1
+    fi
+    if ! tmp="$(mktemp /usr/local/sbin/.virtualmin-clamav-maldet.XXXXXXXX)"; then
+        echo 'WARNING: Cannot allocate temporary security addon script.' >&2
+        return 1
+    fi
+    # Bundle the complete, version-pinned, standalone v1.3 addon as plain text.
+    # It is written only AFTER the required initialization has succeeded.
+    if ! cat > "$tmp" <<'__VIRTUALMIN_CLAMAV_MALDET_ADDON_2026_10__'
+#!/usr/bin/env bash
+# ClamAV + Maldet addon for EXISTING Debian 13 / Virtualmin installations.
+# v1.3 (2026-10-10): durable resumable steps, diagnostics, active service startup.
+# Standalone for now. NOT integrated into initiate_debian13.sh.
+# Install: sudo bash SCRIPT [--install]
+# Verify:  sudo bash SCRIPT --verify       (read-only)
+# Status:  sudo bash SCRIPT --status       (read-only)
+# No full file scans. Does NOT configure Virtualmin, Webmin, Fail2ban, SSHGuard,
+# firewall, Docker, mail, quarantine or clean-up policy.
+# Fresh Maldet: upstream alert-only quarantine defaults are left untouched.
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 027
+
+readonly ADDON_VERSION='1.3.0'
+readonly X_VER='8.0.0'
+readonly LMD_VER='2.0.1'
+readonly X_BASE="https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/${X_VER}"
+readonly LMD_ARCHIVE="https://github.com/rfxn/linux-malware-detect/archive/refs/tags/v${LMD_VER}.tar.gz"
+readonly ROOT_STATE='/var/lib/virtualmin-clamav-maldet-setup'
+readonly DONE_DIR="$ROOT_STATE/done"
+readonly CACHE_DIR="$ROOT_STATE/downloads"
+readonly LOG='/var/log/virtualmin-clamav-maldet-setup.log'
+readonly X_CONF='/etc/clamav-unofficial-sigs'
+readonly X_BIN='/usr/local/sbin/clamav-unofficial-sigs.sh'
+readonly X_MARKER='# Managed by setup-virtualmin-clamav-maldet-debian13.sh'
+readonly X_CRON='/etc/cron.d/clamav-unofficial-sigs'
+readonly X_ROTATE='/etc/logrotate.d/clamav-unofficial-sigs'
+readonly MALDET_HOME='/usr/local/maldetect'
+readonly MALDET_CONF='/usr/local/maldetect/conf.maldet'
+readonly CLAM_DB='/var/lib/clamav'
+readonly MALDET_FRESH_INTENT="$ROOT_STATE/maldet-fresh-intent"
+readonly X_INSTALL_INTENT="$ROOT_STATE/updater-install-intent"
+readonly MODE="${1:---install}"
+CURRENT_STEP='startup'
+LAST_ERROR=''
+SUCCESS=0
+LOCK_FD=''
+
+msg() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
+info() { msg "INFO  $*"; }
+warn() { msg "WARN  $*" >&2; }
+fail() { LAST_ERROR="$*"; msg "ERROR $*" >&2; exit 1; }
+record_failure() {
+  local rc="$1" line="$2" cmd="$3" reason
+  reason="${LAST_ERROR:-Command failed at line $line: $cmd}"
+  if [[ -d "$ROOT_STATE" ]]; then
+    printf 'timestamp=%s\nversion=%s\nstep=%s\nexit_code=%s\nreason=%s\n' \
+      "$(date -Is)" "$ADDON_VERSION" "$CURRENT_STEP" "$rc" "$reason" > "$ROOT_STATE/last_failure"
+  fi
+  warn "ADDON FAILED at step: $CURRENT_STEP (exit $rc)"
+  warn "$reason"
+  warn "Progress retained in $ROOT_STATE; rerun the same script to resume."
+  warn "Detailed log: $LOG"
+}
+on_error() {
+  local rc="$1" line="$2" cmd="$3"
+  LAST_ERROR="${LAST_ERROR:-line $line, command: $cmd}"
+  exit "$rc"
+}
+on_exit() {
+  local rc="$1"
+  if [[ "$MODE" == --install && "$rc" -ne 0 ]]; then
+    record_failure "$rc" "${BASH_LINENO[0]:-?}" "${BASH_COMMAND:-?}"
+  fi
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_exit "$?"' EXIT
+
+usage() {
+  echo "Usage: sudo bash $0 [--install|--verify|--status]" >&2
+  exit 2
+}
+case "$MODE" in --install|--verify|--status) ;; *) usage ;; esac
+[[ $# -le 1 ]] || usage
+[[ $EUID -eq 0 ]] || fail 'Run with sudo/root'
+[[ -r /etc/os-release ]] || fail 'Missing /etc/os-release'
+# shellcheck disable=SC1091
+source /etc/os-release
+[[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 ]] || fail "Debian 13 required (found ${PRETTY_NAME:-unknown})"
+
+if [[ "$MODE" == --status ]]; then
+  echo "Addon version: $ADDON_VERSION"
+  echo "State directory: $ROOT_STATE"
+  if [[ -d "$DONE_DIR" ]]; then
+    printf 'Completed steps:\n'
+    find "$DONE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '  %f\n' | sort
+  else
+    echo 'No recorded steps yet.'
+  fi
+  if [[ -f "$ROOT_STATE/current_step" ]]; then
+    printf 'Last attempted step: '; cat "$ROOT_STATE/current_step"
+  fi
+  if [[ -f "$ROOT_STATE/last_failure" ]]; then
+    printf '\nLast failure:\n'; cat "$ROOT_STATE/last_failure"
+  fi
+  exit 0
+fi
+
+cfg_exact() { grep -Fqx -- "$2" "$1"; }
+monitor_mode_users() {
+  # Maldet service loads both environment files, default being last.
+  # If an existing admin disabled monitoring, never override that decision.
+  local mode=''
+  local f
+  for f in /etc/sysconfig/maldet /etc/default/maldet; do
+    if [[ -f "$f" ]]; then
+      mode=$(sed -n -E 's/^[[:space:]]*MONITOR_MODE="?([^"[:space:]]+)"?[[:space:]]*$/\1/p' "$f" | tail -n 1 || true)
+    fi
+  done
+  [[ "$mode" == users ]]
+}
+monitor_requested() {
+  monitor_mode_users || [[ -f "$MALDET_FRESH_INTENT" ]]
+}
+verify_monitor() {
+  if monitor_requested; then
+    systemctl is-enabled --quiet maldet.service || return 1
+    systemctl is-active --quiet maldet.service || return 1
+    # Restrict process check to this service, not another unrelated inotifywait.
+    systemctl status maldet.service --no-pager -l 2>/dev/null | grep -q 'inotifywait' || return 1
+  fi
+  return 0
+}
+validate_sources() {
+  local f="$X_CONF/user.conf" setting db
+  [[ -s "$X_BIN" && -s "$f" ]] || return 1
+  cfg_exact "$f" "$X_MARKER" || return 1
+  for setting in 'sanesecurity_enabled="yes"' 'interserver_enabled="yes"' \
+    'urlhaus_enabled="yes"' 'linuxmalwaredetect_enabled="no"' \
+    'remove_disabled_databases="no"' 'default_dbs_rating="LOW"' \
+    'allow_upgrades="no"' 'user_configuration_complete="yes"'; do
+    cfg_exact "$f" "$setting" || return 1
+  done
+  for db in junk.ndb interserver256.hdb urlhaus.ndb rfxn.hdb rfxn.ndb; do
+    [[ -s "$CLAM_DB/$db" ]] || return 1
+  done
+  return 0
+}
+verify_all() {
+  local errors=0
+  echo "== Read-only verification (no scans or updates) =="
+  for s in clamav-daemon clamav-freshclam cron; do
+    if systemctl is-active --quiet "$s"; then echo "OK: $s active"; else echo "FAIL: $s inactive"; errors=$((errors+1)); fi
+  done
+  if validate_sources; then echo 'OK: four-source databases and configuration'; else echo 'FAIL: sources/configuration'; errors=$((errors+1)); fi
+  if [[ -s "$MALDET_CONF" ]] && cfg_exact "$MALDET_CONF" 'scan_clamscan="1"' \
+    && cfg_exact "$MALDET_CONF" 'autoupdate_signatures="1"'; then
+    echo 'OK: Maldet ClamAV integration + signature updating'
+  else echo 'FAIL: Maldet integration'; errors=$((errors+1)); fi
+  if [[ -s "$X_CRON" && -s "$X_ROTATE" && -s /etc/cron.daily/maldet ]]; then
+    echo 'OK: updater cron and logrotate configured'
+  else echo 'FAIL: updater schedule/logrotate'; errors=$((errors+1)); fi
+  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
+    if [[ -s /etc/cron.d/maldet-sigup ]]; then echo 'OK: Maldet 6-hour signature job';
+    else echo 'FAIL: Maldet 6-hour signature job missing'; errors=$((errors+1)); fi
+  elif [[ -s /etc/cron.daily/maldet ]]; then
+    echo 'INFO: Maldet signature maintenance via daily cron'
+  else echo 'FAIL: Maldet signature maintenance'; errors=$((errors+1)); fi
+  if verify_monitor; then
+    if monitor_requested; then echo 'OK: Maldet monitoring service active with inotifywait';
+    else echo 'INFO: Maldet monitoring not requested by existing configuration'; fi
+  else echo 'FAIL: Maldet monitor requested but not running'; errors=$((errors+1)); fi
+  if (( errors )); then echo "FAIL: $errors verification check(s)"; return 1; fi
+  echo 'PASS: configured components present and services healthy (no full scan performed)'
+}
+if [[ "$MODE" == --verify ]]; then
+  verify_all
+  exit 0
+fi
+
+# All write operations below are in --install only. Persistent state and full log.
+install -d -m 0750 "$ROOT_STATE" "$DONE_DIR" "$CACHE_DIR"
+touch "$LOG"; chmod 0600 "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+# Avoid simultaneous manual reruns; updater's own cron locking is independent.
+exec {LOCK_FD}>"$ROOT_STATE/installer.lock"
+flock -n "$LOCK_FD" || fail 'Another addon installation is running'
+info "Starting addon v$ADDON_VERSION; previous completed steps will be validated and reused"
+
+# When an earlier stage must be repaired, downstream completion markers cannot
+# be trusted until those stages run again (especially daemon reload after DBs).
+readonly -a STEP_ORDER=(preflight dependencies downloads maldet_install maldet_config maldet_signatures updater_config updater_run daemon schedule monitor complete)
+invalidate_downstream() {
+  local from="$1" step seen=0
+  for step in "${STEP_ORDER[@]}"; do
+    if [[ "$step" == "$from" ]]; then seen=1; continue; fi
+    if (( seen )); then rm -f -- "$DONE_DIR/$step"; fi
+  done
+}
+
+run_step() {
+  local id="$1" title="$2"
+  CURRENT_STEP="$id"
+  printf '%s\n' "$id" > "$ROOT_STATE/current_step"
+  if [[ "$id" != preflight && -f "$DONE_DIR/$id" ]] && "check_$id"; then
+    info "SKIP $id: already completed and still valid"
+    return 0
+  fi
+  info "START $id: $title"
+  if [[ "$id" != preflight ]]; then
+    invalidate_downstream "$id"
+  fi
+  "do_$id"
+  "check_$id" || fail "Validation failed after step $id; see logs above"
+  printf '%s\t%s\t%s\n' "$(date -Is)" "$ADDON_VERSION" "$title" > "$DONE_DIR/$id.tmp.$$"
+  mv -f "$DONE_DIR/$id.tmp.$$" "$DONE_DIR/$id"
+  info "DONE  $id"
+}
+
+# The validators favor stable postconditions, not cached success alone.
+check_preflight() {
+  command -v clamscan >/dev/null && command -v systemctl >/dev/null && \
+    id clamav >/dev/null 2>&1 && [[ -d "$CLAM_DB" ]] && \
+    systemctl is-active --quiet clamav-daemon && \
+    systemctl is-active --quiet clamav-freshclam
+}
+do_preflight() {
+  check_preflight || fail 'Require existing operational ClamAV daemon and FreshClam; no Virtualmin/ClamAV reinstall is attempted'
+  if [[ ! -d /etc/webmin/virtual-server ]]; then
+    warn 'Virtualmin module not found at standard path; addon continues without modifying Virtualmin'
+  fi
+  if dpkg-query -W -f='${Status}' clamav-unofficial-sigs 2>/dev/null | grep -qx 'install ok installed'; then
+    fail 'Debian-packaged clamav-unofficial-sigs already installed; cannot safely take over its databases'
+  fi
+  local found
+  found=$(command -v clamav-unofficial-sigs.sh || true)
+  [[ -z "$found" || "$found" == "$X_BIN" ]] || fail "Different unofficial updater located at $found"
+  if [[ -e "$X_BIN" || -d "$X_CONF" || -e "$X_CRON" ]]; then
+    if [[ -f "$X_CONF/user.conf" ]]; then
+      cfg_exact "$X_CONF/user.conf" "$X_MARKER" || \
+        fail 'Unmanaged unofficial updater exists; refusing to overwrite configuration'
+    elif [[ -f "$X_INSTALL_INTENT" ]]; then
+      warn 'Recognized incomplete updater installation previously started by this addon; resuming'
+    else
+      fail 'Unmanaged or incomplete unofficial updater exists; refusing to take ownership'
+    fi
+  else
+    # Don't claim existing third-party DBs managed by another updater.
+    while IFS= read -r -d '' item; do
+      case "${item##*/}" in
+        rfxn.hdb|rfxn.ndb|rfxn.hsb|rfxn.yara) [[ -d "$MALDET_HOME" ]] && continue ;;
+      esac
+      fail "Unmanaged third-party database detected: $item"
+    done < <(find "$CLAM_DB" -maxdepth 1 -type f \( -name '*.hdb' -o -name '*.hsb' -o -name '*.ndb' \
+      -o -name '*.ldb' -o -name '*.fp' -o -name '*.ign2' -o -name '*.yara' \) -print0)
+  fi
+  if [[ -r /etc/clamav/clamd.conf ]]; then
+    local dbpath
+    dbpath=$(awk '$1=="DatabaseDirectory" {last=$2} END {print last}' /etc/clamav/clamd.conf)
+    [[ -z "$dbpath" || "$dbpath" == "$CLAM_DB" ]] || fail "Nonstandard database directory $dbpath requires manual review"
+  fi
+}
+check_dependencies() {
+  local c
+  for c in curl rsync gpg dig logrotate clamdscan inotifywait tar flock runuser file ps; do
+    command -v "$c" >/dev/null || return 1
+  done
+  systemctl is-active --quiet cron
+}
+do_dependencies() {
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates curl wget rsync gnupg bind9-dnsutils cron logrotate \
+    clamdscan inotify-tools tar procps psmisc file lsof unzip util-linux
+  systemctl enable --now cron
+}
+fetch_cached() {
+  local url="$1" dest="$2"
+  if [[ -s "$dest" ]]; then return 0; fi
+  local tmp="$dest.partial.$$"
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 20 --max-time 300 "$url" -o "$tmp"
+  [[ -s "$tmp" ]] || fail "Empty download from $url"
+  mv -f "$tmp" "$dest"
+}
+check_downloads() {
+  [[ -s "$CACHE_DIR/x.sh" && -s "$CACHE_DIR/master.conf" && -s "$CACHE_DIR/os.conf" \
+      && -s "$CACHE_DIR/user.conf" && -s "$CACHE_DIR/lmd.tar.gz" ]] && \
+    bash -n "$CACHE_DIR/x.sh" && \
+    grep -Fqx 'config_version="100"' "$CACHE_DIR/master.conf" && \
+    grep -q 'Debian 13 trixie' "$CACHE_DIR/os.conf" && \
+    tar -tzf "$CACHE_DIR/lmd.tar.gz" >/dev/null
+}
+do_downloads() {
+  fetch_cached "$X_BASE/clamav-unofficial-sigs.sh" "$CACHE_DIR/x.sh"
+  fetch_cached "$X_BASE/config/master.conf" "$CACHE_DIR/master.conf"
+  fetch_cached "$X_BASE/config/user.conf" "$CACHE_DIR/user.conf"
+  fetch_cached "$X_BASE/config/os/os.debian.conf" "$CACHE_DIR/os.conf"
+  fetch_cached "$LMD_ARCHIVE" "$CACHE_DIR/lmd.tar.gz"
+  check_downloads || fail 'Unexpected upstream downloads, versions, or invalid archive'
+}
+check_maldet_install() { [[ -s "$MALDET_CONF" && -x "$MALDET_HOME/maldet" ]] && command -v maldet >/dev/null; }
+do_maldet_install() {
+  if [[ -d "$MALDET_HOME" ]]; then
+    if check_maldet_install; then
+      info 'Existing Maldet detected; preserving its version/quarantine/clean policy'
+      return 0
+    fi
+    if [[ ! -f "$MALDET_FRESH_INTENT" ]]; then
+      fail 'Partial pre-existing Maldet installation; manual inspection required'
+    fi
+    warn 'Retrying interrupted Maldet installation originally started by this addon'
+  else
+    command -v maldet >/dev/null 2>&1 && fail 'Maldet exists outside expected /usr/local/maldetect path'
+    # Record intent BEFORE starting installer, surviving any interruption.
+    printf '%s\n' "$(date -Is)" > "$MALDET_FRESH_INTENT"
+  fi
+  local src="$ROOT_STATE/maldet-source"
+  install -d -m 0750 "$src"
+  tar -xzf "$CACHE_DIR/lmd.tar.gz" -C "$src" --strip-components=1
+  [[ -s "$src/install.sh" ]] || fail 'Missing Maldet installer in archive'
+  bash -n "$src/install.sh"
+  grep -Fq 'lmd_version="2.0.1"' "$src/install.sh" || fail 'Unexpected Maldet version'
+  (cd "$src" && bash ./install.sh)
+}
+check_maldet_config() {
+  check_maldet_install && cfg_exact "$MALDET_CONF" 'scan_clamscan="1"' && \
+    cfg_exact "$MALDET_CONF" 'autoupdate_signatures="1"' || return 1
+  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
+    monitor_mode_users || return 1
+  fi
+  if [[ -n "${MALDET_ALERT_EMAIL:-}" ]]; then
+    cfg_exact "$MALDET_CONF" 'email_alert="1"' &&
+      cfg_exact "$MALDET_CONF" "email_addr=\"$MALDET_ALERT_EMAIL\"" || return 1
+  fi
+  return 0
+}
+set_maldet_setting() {
+  local key="$1" val="$2" existing
+  existing=$(grep -E "^${key}=" "$MALDET_CONF" | tail -n 1 || true)
+  [[ -n "$existing" ]] || fail "Maldet setting $key missing; unsupported configuration"
+  [[ "$existing" == "${key}=\"${val}\"" ]] && return 0
+  cp -a "$MALDET_CONF" "$MALDET_CONF.bak-$(date +%Y%m%d-%H%M%S)"
+  sed -i -E "s|^${key}=.*|${key}=\"${val}\"|" "$MALDET_CONF"
+}
+do_maldet_config() {
+  set_maldet_setting scan_clamscan 1
+  set_maldet_setting autoupdate_signatures 1
+  if [[ -n "${MALDET_ALERT_EMAIL:-}" ]]; then
+    [[ "$MALDET_ALERT_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || fail 'MALDET_ALERT_EMAIL invalid'
+    set_maldet_setting email_alert 1
+    set_maldet_setting email_addr "$MALDET_ALERT_EMAIL"
+  fi
+  # Fresh installs only: monitor starts in 'users' mode via systemd env.
+  # Existing installations retain their explicitly chosen mode.
+  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
+    [[ -f /etc/default/maldet ]] || fail 'Fresh Maldet missing /etc/default/maldet'
+    if grep -q '^MONITOR_MODE=' /etc/default/maldet; then
+      sed -i -E 's|^MONITOR_MODE=.*|MONITOR_MODE="users"|' /etc/default/maldet
+    else
+      printf '%s\n' 'MONITOR_MODE="users"' >> /etc/default/maldet
+    fi
+  fi
+}
+check_maldet_signatures() { [[ -s "$CLAM_DB/rfxn.hdb" && -s "$CLAM_DB/rfxn.ndb" ]]; }
+do_maldet_signatures() { maldet -u; }
+check_updater_config() {
+  [[ -x "$X_BIN" && -s "$X_CONF/master.conf" && -s "$X_CONF/os.conf" \
+     && -s "$X_CONF/user.conf" ]] && \
+    cfg_exact "$X_CONF/user.conf" "$X_MARKER" && \
+    cfg_exact "$X_CONF/user.conf" 'linuxmalwaredetect_enabled="no"' && \
+    cfg_exact "$X_CONF/user.conf" 'remove_disabled_databases="no"' && \
+    cfg_exact "$X_CONF/user.conf" 'default_dbs_rating="LOW"'
+}
+do_updater_config() {
+  local conf_stage="$ROOT_STATE/user.conf.new" f
+  cp "$CACHE_DIR/user.conf" "$conf_stage"
+  cat >> "$conf_stage" <<'CONFIG'
+
+# Managed by setup-virtualmin-clamav-maldet-debian13.sh
+sanesecurity_enabled="yes"
+interserver_enabled="yes"
+urlhaus_enabled="yes"
+# Maldet owns rfxn.* signature DBs; avoid competing updates/deletion.
+linuxmalwaredetect_enabled="no"
+remove_disabled_databases="no"
+malwareexpert_enabled="no"
+malwarepatrol_enabled="no"
+securiteinfo_enabled="no"
+ditekshen_enabled="no"
+twinclams_enabled="no"
+yararulesproject_enabled="no"
+additional_enabled="no"
+default_dbs_rating="LOW"
+allow_upgrades="no"
+user_configuration_complete="yes"
+CONFIG
+  # master.conf is NOT standalone Bash syntax (contains name|RATING arrays).
+  # Only run bash -n on the executable, never on master.conf.
+  bash -n "$CACHE_DIR/x.sh" || fail 'Downloaded executable failed syntax test'
+  install -d -m 0755 "$X_CONF"
+  if [[ -f "$X_CONF/user.conf" ]] && ! cfg_exact "$X_CONF/user.conf" "$X_MARKER"; then
+    fail 'Unmanaged unofficial-sigs user.conf detected; will not overwrite it'
+  fi
+  # Record ownership intent BEFORE the first managed file is written.
+  # This prevents a power loss after master.conf from creating an unresumable
+  # "unmanaged partial installation" on the next run.
+  printf '%s\n' "$(date -Is)" > "$X_INSTALL_INTENT"
+  if [[ -f "$X_CONF/user.conf" ]] && ! cmp -s "$X_CONF/user.conf" "$conf_stage"; then
+    cp -a "$X_CONF/user.conf" "$X_CONF/user.conf.bak-$(date +%Y%m%d-%H%M%S)"
+  fi
+  install -o root -g root -m 0644 "$CACHE_DIR/master.conf" "$X_CONF/master.conf"
+  install -o root -g root -m 0644 "$CACHE_DIR/os.conf" "$X_CONF/os.conf"
+  install -o root -g clamav -m 0640 "$conf_stage" "$X_CONF/user.conf"
+  install -o root -g root -m 0755 "$CACHE_DIR/x.sh" "$X_BIN"
+  "$X_BIN" --information
+}
+check_updater_run() { [[ -s "$CLAM_DB/junk.ndb" && -s "$CLAM_DB/interserver256.hdb" && -s "$CLAM_DB/urlhaus.ndb" ]]; }
+do_updater_run() {
+  # No --force: provider rate limits are respected.
+  if ps -eo args= | grep -E '[c]lamav-unofficial-sigs[.]sh( |$)' >/dev/null; then
+    fail 'Updater already running from cron; rerun after it finishes'
+  fi
+  "$X_BIN"
+}
+check_daemon() { systemctl is-active --quiet clamav-daemon && clamdscan --version >/dev/null 2>&1; }
+do_daemon() {
+  # Request a single reload, then ensure daemon responds. No full scan.
+  clamdscan --reload
+  local good=0 i
+  for ((i=0; i<36; i++)); do
+    if clamdscan --fdpass --no-summary /etc/hosts >/dev/null 2>&1; then good=1; break; fi
+    sleep 5
+  done
+  ((good)) || fail 'ClamAV daemon not responding after database reload'
+}
+check_schedule() {
+  [[ -s "$X_CRON" && -s "$X_ROTATE" && -s /etc/cron.daily/maldet ]] && \
+    systemctl is-active --quiet cron && \
+    grep -Eq '^[0-9]{1,2} \* \* \* \* +clamav ' "$X_CRON" && \
+    command -v logrotate >/dev/null || return 1
+  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
+    [[ -s /etc/cron.d/maldet-sigup ]] || return 1
+  fi
+  return 0
+}
+do_schedule() {
+  "$X_BIN" --install-logrotate
+  logrotate -d "$X_ROTATE" >/dev/null 2>&1 || fail 'Unofficial updater logrotate config invalid'
+  for p in "$CLAM_DB" /var/lib/clamav-unofficial-sigs /var/log/clamav-unofficial-sigs/clamav-unofficial-sigs.log; do
+    runuser -u clamav -- test -w "$p" || fail "clamav user cannot write $p"
+  done
+  "$X_BIN" --install-cron
+  [[ -s /etc/cron.daily/maldet ]] || fail 'Maldet daily cron missing'
+  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
+    [[ -s /etc/cron.d/maldet-sigup ]] || fail 'Configured Maldet six-hour signature cron missing'
+  fi
+  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
+    [[ -s /etc/logrotate.d/maldet ]] || fail 'Expected Maldet logrotate config missing'
+  fi
+  systemctl enable --now cron
+}
+check_monitor() { verify_monitor; }
+do_monitor() {
+  if monitor_requested; then
+    if [[ -f "$MALDET_FRESH_INTENT" ]]; then
+      [[ -f /etc/default/maldet ]] || fail 'New Maldet missing /etc/default/maldet'
+      grep -Fqx 'MONITOR_MODE="users"' /etc/default/maldet || fail 'Fresh Maldet monitor mode not users'
+    fi
+    systemctl daemon-reload
+    systemctl enable maldet.service
+    # Important v1.3 fix: 'enable' alone doesn't start an already-enabled
+    # service. Explicitly start and verify this service's inotify process.
+    if ! systemctl is-active --quiet maldet.service; then
+      systemctl start maldet.service || fail 'Maldet service failed: journalctl -u maldet -n 60'
+    fi
+    local ready=0 i
+    for ((i=0; i<12; i++)); do
+      if verify_monitor; then ready=1; break; fi
+      sleep 2
+    done
+    ((ready)) || fail 'Maldet service not healthy/inotifywait missing. Check journalctl -u maldet -n 60'
+  else
+    info 'Existing Maldet monitoring intentionally unconfigured; preserving its existing choice'
+  fi
+}
+check_complete() { validate_sources && check_maldet_config && check_schedule && check_monitor && check_daemon; }
+do_complete() {
+  info 'Final checks: configuration, database presence, services and cron only; no full scan'
+  verify_all
+}
+
+run_step preflight 'Check existing ClamAV, Virtualmin, and signature ownership'
+run_step dependencies 'Install only missing utilities and enable cron'
+run_step downloads 'Download pinned upstream files to persistent cache'
+run_step maldet_install 'Install Maldet if absent, recording fresh-install intent'
+run_step maldet_config 'Enable Maldet ClamAV engine; preserve quarantine policy'
+run_step maldet_signatures 'Update Maldet native rfxn.* signatures'
+run_step updater_config 'Configure three extra feeds and separate signature ownership'
+run_step updater_run 'Download/validate third-party ClamAV signatures'
+run_step daemon 'Reload and probe ClamAV daemon'
+run_step schedule 'Configure hourly update and log rotation'
+run_step monitor 'Start/verify Maldet systemd inotify monitoring if requested'
+run_step complete 'Validate installed system end-to-end without a full scan'
+CURRENT_STEP='complete'
+rm -f "$ROOT_STATE/last_failure"
+printf '%s\n' "$(date -Is)" > "$ROOT_STATE/completed_at"
+SUCCESS=1
+info "SUCCESS: ClamAV + Maldet addon operational; no full scan performed"
+info "Inspect state: sudo bash $0 --status"
+info "Verify read-only: sudo bash $0 --verify"
+__VIRTUALMIN_CLAMAV_MALDET_ADDON_2026_10__
+    then
+        echo 'WARNING: Could not write embedded security addon.' >&2
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! bash -n "$tmp"; then
+        echo 'WARNING: Embedded security addon failed Bash syntax validation.' >&2
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! chmod 0755 "$tmp" || ! mv -f -- "$tmp" "$SEC_ADDON_SCRIPT"; then
+        echo 'WARNING: Could not install security addon executable.' >&2
+        rm -f -- "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# This optional stage must never trip the parent's ERR or EXIT failure traps.
+# Explicit if/else branches protect every step under set -Eeuo pipefail.
+if [[ "${INSTALL_COMPLETE:-0}" != '1' ]]; then
+    echo 'WARNING: Required server installation is incomplete; security addon skipped.' >&2
+elif [[ "${OS_ID:-}" != 'debian' || "${OS_VERSION_ID:-}" != '13' ]]; then
+    echo "NOTICE: Optional ClamAV/Maldet addon is Debian 13-only; skipping for ${PRETTY_NAME:-this OS}."
+else
+    echo
+    echo '============================================================'
+    echo ' Optional final stage: ClamAV sources + Maldet'
+    echo '============================================================'
+    if ! install_security_addon_script; then
+        echo 'WARNING: Security addon extraction failed; main server installation remains successful.' >&2
+        echo "INFO: Main setup log: $LOG_FILE"
+    elif step_done "$SEC_ADDON_STEP" && bash "$SEC_ADDON_SCRIPT" --verify; then
+        echo 'SUCCESS: Previously installed security addon passed verification; nothing to redo.'
+    else
+        if bash "$SEC_ADDON_SCRIPT" --install; then
+            if bash "$SEC_ADDON_SCRIPT" --verify; then
+                if mark_done "$SEC_ADDON_STEP"; then
+                    echo 'SUCCESS: ClamAV/Maldet optional stage installed, verified, and recorded.'
+                else
+                    echo 'WARNING: Addon works, but the parent setup state could not record completion.' >&2
+                fi
+            else
+                echo 'WARNING: Security addon ran, but final verification failed.' >&2
+                echo 'WARNING: Main Virtualmin/Docker/Nextcloud installation remains successful.' >&2
+            fi
+        else
+            echo 'WARNING: Optional ClamAV/Maldet addon failed.' >&2
+            echo 'WARNING: All required earlier setup steps remain successful.' >&2
+        fi
+    fi
+    echo "Addon progress: $SEC_ADDON_STATE"
+    echo 'Addon log: /var/log/virtualmin-clamav-maldet-setup.log'
+    echo "Resume only this addon: sudo bash $SEC_ADDON_SCRIPT --install"
+    echo "Inspect progress:       sudo bash $SEC_ADDON_SCRIPT --status"
+    echo "Verify installed addon: sudo bash $SEC_ADDON_SCRIPT --verify"
+fi
+# INSTALL_COMPLETE remains 1. Main setup status is not dependent on addon.
