@@ -633,169 +633,320 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# Step 4b: Webmin nftables — allow Docker bridge forwarding
+# Step 4b: Webmin nftables — default-deny public Docker bridge forwarding
 # ---------------------------------------------------------------------------
-# Webmin 2.670+ manages the native system nftables configuration, normally
-# /etc/nftables.conf. Its host firewall may have a forward base chain whose
-# policy is drop. Docker's independent nftables base chains cannot override
-# that drop, so Docker bridge packets must also be accepted in THIS chain.
-#
-# The saved rules are modified atomically after nft syntax validation.
-# Live rules are inserted individually so we never flush Docker's tables.
-# Never modify Docker's own docker-bridges tables.
-# ---------------------------------------------------------------------------
+# Recheck on every run, including installs with the older state marker.
+# Only explicitly listed published host ports are allowed from outside.
+# Host INPUT ports and public Docker FORWARD ports use separate sets.
+# The embedded repair keeps Docker/Fail2ban tables intact during reloads.
+log_step "Configuring and verifying Docker forwarding allowlists and firewall lifecycle"
+(
+# Repair Webmin firewall lifecycle and restrict public Docker bridge ingress.
+# Run as root. Existing Docker containers are not restarted.
+# Initial allowlists contain Talk's 3478 TCP/UDP. Set either variable to an
+# empty string before the first run to create an empty allowlist instead.
+# Existing allowlists are always preserved; edit their sets in nftables.conf.
+set -Eeuo pipefail
+export LC_ALL=C
 
-if ! step_done "firewall_docker_forward"; then
+[[ $EUID -eq 0 ]] || { echo 'Run this script as root.' >&2; exit 1; }
+for command in nft systemctl awk curl; do
+    command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
+done
+[[ -s /etc/nftables.conf ]] || { echo 'Missing /etc/nftables.conf' >&2; exit 1; }
 
-    log_step "Configuring persistent Webmin nftables forwarding for Docker"
+repair_tmp=$(mktemp -d)
+trap 'rm -rf "$repair_tmp"' EXIT
 
-    NFT_RULES_CONF="/etc/nftables.conf"
-    if [[ ! -f "$NFT_RULES_CONF" ]]; then
-        log_error "Webmin system nftables file not found: $NFT_RULES_CONF"
-        log_error "Inspect Webmin -> Networking -> Linux Firewall (nftables) -> Edit Config Files."
-        log_error "The installer will not guess a firewall configuration."
-        exit 1
-    fi
+# Render a complete atomic transaction for only Webmin-owned host tables.
+# The renderer rejects includes, arbitrary commands and externally owned tables.
+cat > "$repair_tmp/virtualmin-nftables-host" <<'HOST_HELPER'
+#!/bin/bash
+set -Eeuo pipefail
+export LC_ALL=C
+mode=${1:-apply}
+case "$mode" in render|check|apply|stop) ;; *) echo 'Use render, check, apply or stop.' >&2; exit 2 ;; esac
+conf=${2:-/etc/nftables.conf}
+[[ -s "$conf" ]] || { echo "Missing $conf" >&2; exit 1; }
+tmp=$(mktemp -d /run/virtualmin-nftables-XXXXXXXX)
+trap 'rm -rf "$tmp"' EXIT
 
-    # This patch intentionally expects one recognizable, system-managed
-    # 'inet' forward chain with policy drop in /etc/nftables.conf.
-    # Included-file or significantly different layouts stop safely.
-    NFT_METADATA="$(mktemp)"
-    NFT_CANDIDATE="$(mktemp /etc/.nftables-docker-XXXXXXXX)"
-
-    if ! awk -v meta="$NFT_METADATA" '
-        { source[NR] = $0 }
-        /^[[:space:]]*table[[:space:]]+[a-zA-Z0-9_-]+[[:space:]]+[a-zA-Z0-9_-]+[[:space:]]*\{/ {
-            in_table = ($2 == "inet")
-            table_name = in_table ? $3 : ""
+awk -v stop_mode="$([[ $mode == stop ]] && echo 1 || echo 0)" '
+    function fail(message) { print message > "/dev/stderr"; bad=1; exit 1 }
+    function owned(family, name) {
+        return family == "inet" && (name == "filter" || name ~ /^webmin_profile_[A-Za-z0-9_]+$/)
+    }
+    {
+        original=$0
+        code=$0
+        # Strip quoted strings before counting braces or finding comments.
+        gsub(/"([^"\\]|\\.)*"/, "\"\"", code)
+        sub(/#.*/, "", code)
+        if (code ~ /^[[:space:]]*$/) {
+            if (original !~ /^#!/ && original !~ /^# Managed host-only nftables transaction/ && nbody > 0)
+                body[++nbody]=original
+            next
         }
-        in_table && /^[[:space:]]*chain[[:space:]]+forward[[:space:]]*\{/ {
-            in_chain = 1
-            chain_start = NR
-            hook = 0
-            drop = 0
-            policy_line = 0
+        if (depth == 0) {
+            if (code ~ /^[[:space:]]*flush[[:space:]]+ruleset[[:space:]]*;?[[:space:]]*$/) next
+            if (code ~ /^[[:space:]]*(add|delete)[[:space:]]+table[[:space:]]+inet[[:space:]]+[A-Za-z0-9_]+[[:space:]]*;?[[:space:]]*$/) {
+                name=$4; sub(/;$/, "", name)
+                if (!owned($3,name)) fail("Refusing to modify a non-Webmin table: " original)
+                next
+            }
+            if (code !~ /^[[:space:]]*table[[:space:]]+inet[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{[[:space:]]*$/)
+                fail("Unsupported top-level firewall syntax; no rules applied: " original)
+            if (!owned($2,$3)) fail("Externally managed table in saved host configuration: " $3)
+            if (seen[$3]++) fail("Duplicate saved table: " $3)
+            names[++ntables]=$3
+            if ($3 ~ /^webmin_profile_/) profiles++
         }
-        in_chain {
-            if ($0 ~ /hook[[:space:]]+forward([[:space:];]|$)/) hook = 1
-            if ($0 ~ /policy[[:space:]]+drop([[:space:];]|$)/) {
-                drop = 1
-                policy_line = NR
-            }
-            if (NR > chain_start && $0 ~ /^[[:space:]]*\}[[:space:]]*;?[[:space:]]*$/) {
-                if (hook && drop) {
-                    count++
-                    chosen_table = table_name
-                    insertion_line = policy_line
-                    chosen_start = chain_start
-                    chosen_end = NR
-                }
-                in_chain = 0
-            }
+        if (code ~ /^[[:space:]]*include[[:space:]]/)
+            fail("Included firewall files require a separate review; no rules applied.")
+        body[++nbody]=original
+        opens=gsub(/\{/, "{", code); closes=gsub(/\}/, "}", code)
+        depth+=opens-closes
+        if (depth < 0) fail("Unbalanced firewall configuration.")
+    }
+    END {
+        if (bad) exit 1
+        if (depth != 0 || ntables == 0 || profiles == 0) fail("Expected complete Webmin host profile tables.")
+        print "#!/usr/sbin/nft -f"
+        print "# Managed host-only nftables transaction (virtualmin-docker)"
+        for (i=1; i<=ntables; i++) {
+            # add is idempotent; delete then removes old chains AND set elements.
+            # All commands are committed in one nft transaction.
+            print "add table inet " names[i]
+            print "delete table inet " names[i]
         }
-        END {
-            if (count != 1) {
-                printf "Expected one inet forward/drop chain; found %d.\n", count > "/dev/stderr"
-                exit 1
-            }
-            print chosen_table > meta
-            marker = "# Docker bridge forwarding (initiate_debian13.sh)"
-            found = 0
-            marker_found = 0
-            for (i = chosen_start; i <= chosen_end; i++) {
-                if (index(source[i], marker)) marker_found = 1
-                if (index(source[i], "iifname \"docker0\" accept")) found++
-                if (index(source[i], "iifname \"br-*\" accept")) found++
-                if (index(source[i], "oifname \"docker0\" accept")) found++
-                if (index(source[i], "oifname \"br-*\" accept")) found++
-            }
-            if (found == 4) {
-                exists = 1
-            }
-            else if (found != 0 || marker_found) {
-                print "Incomplete Docker forwarding block; refusing to guess." > "/dev/stderr"
-                exit 1
-            }
-            for (i = 1; i <= NR; i++) {
-                print source[i]
-                if (i == insertion_line && !exists) {
-                    print "        " marker
-                    print "        iifname \"docker0\" accept"
-                    print "        iifname \"br-*\" accept"
-                    print "        oifname \"docker0\" accept"
-                    print "        oifname \"br-*\" accept"
-                }
-            }
-        }
-    ' "$NFT_RULES_CONF" > "$NFT_CANDIDATE"; then
-        rm -f "$NFT_METADATA" "$NFT_CANDIDATE"
-        log_error "Could not safely identify the Webmin-managed forward/drop chain."
-        log_error "No firewall configuration was changed. Inspect $NFT_RULES_CONF."
-        exit 1
-    fi
+        if (!stop_mode) for (i=1; i<=nbody; i++) print body[i]
+    }
+' "$conf" > "$tmp/rules.nft"
 
-    NFT_TABLE="$(cat "$NFT_METADATA")"
-    rm -f "$NFT_METADATA"
-
-    if ! nft -c -f "$NFT_CANDIDATE"; then
-        rm -f "$NFT_CANDIDATE"
-        log_error "Candidate nftables configuration failed syntax validation; original untouched."
-        exit 1
-    fi
-
-    # Also verify the exact chain already exists in the running ruleset.
-    # Do not attempt to activate an unexpected or incomplete firewall profile.
-    if ! nft list chain inet "$NFT_TABLE" forward | grep -Eq 'policy[[:space:]]+drop'; then
-        rm -f "$NFT_CANDIDATE"
-        log_error "Expected active inet $NFT_TABLE forward chain with policy drop."
-        log_error "Apply the Virtualmin hosting firewall profile before running this installer."
-        exit 1
-    fi
-
-    if ! cmp -s "$NFT_RULES_CONF" "$NFT_CANDIDATE"; then
-        cp -a "$NFT_RULES_CONF" "${NFT_RULES_CONF}.pre-docker-$(date +%Y%m%d_%H%M%S)"
-        chmod --reference="$NFT_RULES_CONF" "$NFT_CANDIDATE"
-        chown --reference="$NFT_RULES_CONF" "$NFT_CANDIDATE"
-        mv "$NFT_CANDIDATE" "$NFT_RULES_CONF"
-        log_success "Persistent Docker forwarding rules saved in $NFT_RULES_CONF."
-    else
-        rm -f "$NFT_CANDIDATE"
-        log_success "Persistent Docker forwarding rules already present."
-    fi
-
-    # Apply ONLY missing Docker bridge exceptions to the active chain.
-    # This does not flush any rulesets and does not touch Docker-owned tables.
-    for expression in \
-        'iifname "docker0" accept' \
-        'iifname "br-*" accept' \
-        'oifname "docker0" accept' \
-        'oifname "br-*" accept'
-    do
-        if ! nft list chain inet "$NFT_TABLE" forward | grep -Fq "$expression"; then
-            printf 'insert rule inet %s forward %s\n' "$NFT_TABLE" "$expression" | nft -f -
-        fi
-    done
-
-    for expression in \
-        'iifname "docker0" accept' \
-        'iifname "br-*" accept' \
-        'oifname "docker0" accept' \
-        'oifname "br-*" accept'
-    do
-        if ! nft list chain inet "$NFT_TABLE" forward | grep -Fq "$expression"; then
-            log_error "Live nftables exception not present: $expression"
-            exit 1
-        fi
-    done
-
-    log_success "Webmin forwarding chain allows Docker bridges in both directions."
-    mark_done "firewall_docker_forward"
-
-else
-
-    log_success "Virtualmin nftables Docker forwarding already configured, skipping."
+if [[ $mode == render ]]; then
+    cat "$tmp/rules.nft"
+    exit 0
 fi
+/usr/sbin/nft -c -f "$tmp/rules.nft"
+if [[ $mode != check ]]; then
+    /usr/sbin/nft -f "$tmp/rules.nft"
+fi
+HOST_HELPER
+chmod 700 "$repair_tmp/virtualmin-nftables-host"
 
+echo 'Validating a host-only firewall transaction...'
+"$repair_tmp/virtualmin-nftables-host" render > "$repair_tmp/host-original.nft"
+
+# These defaults seed NEW sets only. Repeat runs retain all manual changes,
+# including empty allowlists. Do not copy the broad hosting/FTP port ranges.
+docker_tcp_ports=${DOCKER_PUBLIC_TCP_PORTS-3478}
+docker_udp_ports=${DOCKER_PUBLIC_UDP_PORTS-3478}
+for ports in "$docker_tcp_ports" "$docker_udp_ports"; do
+    if [[ -n "$ports" ]] && ! awk -v ports="$ports" 'BEGIN {
+        n=split(ports,a,",")
+        for (i=1;i<=n;i++) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[i])
+            if (a[i] !~ /^[0-9]+$/ || a[i]+0 < 1 || a[i]+0 > 65535) exit 1
+        }
+    }'; then
+        echo 'Initial Docker port lists must be comma-separated numbers from 1 to 65535.' >&2
+        exit 1
+    fi
+done
+
+# Docker performs DNAT before FORWARD. Match the original HOST port.
+# The explicit DNAT drops precede the established rule, so removing a public
+# port from an allowlist also blocks existing inbound connections to that port.
+cat > "$repair_tmp/forward-rules" <<'FORWARD_RULES'
+ct state invalid drop
+iifname "docker0" accept
+iifname "br-*" accept
+oifname "docker0" ct status dnat meta l4proto tcp ct original proto-dst @docker_public_tcp_ports accept
+oifname "br-*" ct status dnat meta l4proto tcp ct original proto-dst @docker_public_tcp_ports accept
+oifname "docker0" ct status dnat meta l4proto udp ct original proto-dst @docker_public_udp_ports accept
+oifname "br-*" ct status dnat meta l4proto udp ct original proto-dst @docker_public_udp_ports accept
+oifname "docker0" ct status dnat ct state related meta l4proto { icmp, ipv6-icmp } accept
+oifname "br-*" ct status dnat ct state related meta l4proto { icmp, ipv6-icmp } accept
+oifname "docker0" ct status dnat counter drop
+oifname "br-*" ct status dnat counter drop
+ct state established,related accept
+FORWARD_RULES
+
+# Replace only a recognized empty, legacy or already-managed forward chain.
+# Unknown forwarding rules stop the migration rather than being discarded.
+awk -v rules_file="$repair_tmp/forward-rules" \
+    -v tcp_ports="$docker_tcp_ports" -v udp_ports="$docker_udp_ports" '
+    function fail(message) { print message > "/dev/stderr"; bad=1; exit 1 }
+    function trim(s) {
+        sub(/^[[:space:]]+/, "", s); sub(/[[:space:];]+$/, "", s)
+        gsub(/[[:space:]]+/, " ", s); return s
+    }
+    function port_set(name, ports) {
+        print "    set " name " {"
+        print "        type inet_service;"
+        print "        flags interval;"
+        if (ports != "") print "        elements = { " ports " };"
+        print "    }"
+    }
+    BEGIN {
+        while ((getline line < rules_file) > 0) { rules[++nrules]=line; known[trim(line)]=1 }
+        close(rules_file)
+        legacy["iifname \"docker0\" accept"]=1
+        legacy["iifname \"br-*\" accept"]=1
+        legacy["oifname \"docker0\" accept"]=1
+        legacy["oifname \"br-*\" accept"]=1
+    }
+    {
+        source[NR]=$0
+        code=$0; gsub(/"([^"\\]|\\.)*"/, "\"\"", code); sub(/#.*/, "", code)
+        if (depth == 0 && code ~ /^[[:space:]]*table[[:space:]]+inet[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/) {
+            table_name=$3
+        }
+        if (depth == 1 && table_name ~ /^webmin_profile_/ &&
+            code ~ /^[[:space:]]*chain[[:space:]]+forward[[:space:]]*\{/) {
+            count++; chosen_table=table_name; first=NR; in_forward=1
+        }
+        if (in_forward && index($0, "# Docker public forwarding allowlist (virtualmin-docker)")) managed=1
+        if (depth == 1 && table_name ~ /^webmin_profile_/ &&
+            code ~ /^[[:space:]]*set[[:space:]]+docker_public_(tcp|udp)_ports[[:space:]]*\{/) {
+            if ($2 == "docker_public_tcp_ports") tcp_sets++
+            else udp_sets++
+            set_table=table_name
+        }
+        opens=gsub(/\{/, "{", code); closes=gsub(/\}/, "}", code)
+        depth+=opens-closes
+        if (in_forward && depth == 1 && closes) { last=NR; in_forward=0 }
+    }
+    END {
+        if (bad) exit 1
+        if (count != 1 || !last) fail("Expected one Webmin forward chain; no changes made.")
+        if ((tcp_sets || udp_sets) &&
+            (tcp_sets != 1 || udp_sets != 1 || set_table != chosen_table || !managed))
+            fail("Unrecognized Docker allowlist sets; no changes made.")
+        for (i=first+1; i<last; i++) {
+            line=source[i]; sub(/#.*/, "", line); line=trim(line)
+            if (line == "") continue
+            if (line ~ /^type filter hook forward priority (0|filter); policy drop$/) { hooks++; continue }
+            if (managed) {
+                if (!known[line] || seen[line]++) fail("Unexpected managed forwarding rule: " line)
+                managed_rules++
+            }
+            else {
+                if (!legacy[line] || seen[line]++) fail("Custom forwarding rules require review: " line)
+                legacy_rules++
+            }
+        }
+        if (hooks != 1 || (managed && (managed_rules != nrules || tcp_sets != 1 || udp_sets != 1)) ||
+            (!managed && legacy_rules != 0 && legacy_rules != 4))
+            fail("Incomplete or unsupported forwarding policy; no changes made.")
+        for (i=1;i<=NR;i++) {
+            if (i == first) {
+                if (!tcp_sets) {
+                    port_set("docker_public_tcp_ports", tcp_ports)
+                    port_set("docker_public_udp_ports", udp_ports)
+                }
+                print "    chain forward {"
+                print "        type filter hook forward priority 0; policy drop;"
+                print "        # Docker public forwarding allowlist (virtualmin-docker)"
+                for (j=1;j<=nrules;j++) print "        " rules[j]
+                print "    }"
+            }
+            if (i < first || i > last) print source[i]
+        }
+    }
+' "$repair_tmp/host-original.nft" > "$repair_tmp/nftables.conf"
+nft -c -f "$repair_tmp/nftables.conf"
+
+# Retain handles of existing externally owned tables; reload must preserve them.
+nft -a list tables > "$repair_tmp/tables.before"
+awk '$3 ~ /^(docker|f2b)/ {print}' "$repair_tmp/tables.before" > "$repair_tmp/external.before"
+
+repair_backup="/root/firewall-repair-backup-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -m 700 "$repair_backup"
+cp -a /etc/nftables.conf "$repair_backup/"
+for file in /etc/systemd/system/nftables.service.d/90-virtualmin-docker.conf \
+            /etc/systemd/system/docker.service.d/90-host-firewall.conf \
+            /usr/local/sbin/virtualmin-nftables-host; do
+    if [[ -e "$file" ]]; then cp -a --parents "$file" "$repair_backup/"; fi
+done
+echo "Configuration backup: $repair_backup"
+
+install -m 755 "$repair_tmp/virtualmin-nftables-host" /usr/local/sbin/virtualmin-nftables-host
+
+# Keep the saved file safe even when loaded directly with nft -f.
+# Webmin keeps the original gaps around table definitions when editing them.
+repair_candidate=$(mktemp /etc/.nftables-host-XXXXXXXX)
+cp "$repair_tmp/nftables.conf" "$repair_candidate"
+chmod --reference=/etc/nftables.conf "$repair_candidate"
+chown --reference=/etc/nftables.conf "$repair_candidate"
+mv "$repair_candidate" /etc/nftables.conf
+
+mkdir -p /etc/systemd/system/nftables.service.d /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/nftables.service.d/90-virtualmin-docker.conf <<'NFT_SERVICE'
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/virtualmin-nftables-host apply
+ExecReload=
+ExecReload=/usr/local/sbin/virtualmin-nftables-host apply
+ExecStop=
+ExecStop=/usr/local/sbin/virtualmin-nftables-host stop
+NFT_SERVICE
+cat > /etc/systemd/system/docker.service.d/90-host-firewall.conf <<'DOCKER_ORDER'
+[Unit]
+Wants=nftables.service
+After=nftables.service
+DOCKER_ORDER
+systemctl daemon-reload
+
+for property in ExecStart ExecReload ExecStop; do
+    systemctl show nftables -p "$property" --value | grep -Fq '/usr/local/sbin/virtualmin-nftables-host' || {
+        echo "Another systemd override conflicts with $property. Firewall was not started." >&2
+        exit 1
+    }
+done
+systemctl enable nftables
+if systemctl is-active --quiet nftables; then
+    systemctl reload nftables
+else
+    systemctl start nftables
+fi
+# Test a second load too: it must be safe and must not duplicate old rules.
+systemctl reload nftables
+systemctl is-active --quiet nftables
+systemctl is-enabled --quiet nftables
+
+nft -a list tables > "$repair_tmp/tables.after"
+while IFS= read -r table; do
+    grep -Fxq "$table" "$repair_tmp/tables.after" || {
+        echo "An existing Docker/Fail2ban table changed during firewall activation: $table" >&2
+        exit 1
+    }
+done < "$repair_tmp/external.before"
+
+profile=$(awk '$1 == "table" && $2 == "inet" && $3 ~ /^webmin_profile_/ {print $3; exit}' /etc/nftables.conf)
+nft list chain inet "$profile" input | grep -Eq 'policy[[:space:]]+drop'
+nft list chain inet "$profile" forward | grep -Eq 'policy[[:space:]]+drop'
+
+if command -v docker >/dev/null && systemctl is-active --quiet docker; then
+    for mapping in 'portainer 9443' 'nextcloud-aio-mastercontainer 8080'; do
+        read -r container port <<< "$mapping"
+        if [[ $(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true) == true ]]; then
+            curl -kfsS --connect-timeout 5 --max-time 15 -o /dev/null "https://127.0.0.1:$port/"
+            echo "$container: local HTTPS passed with the firewall active."
+        fi
+    done
+    if [[ $(docker inspect --format '{{.State.Running}}' nextcloud-aio-nextcloud 2>/dev/null || true) == true ]]; then
+        docker exec nextcloud-aio-nextcloud curl -fsS --connect-timeout 5 --max-time 20 \
+            -o /dev/null https://download.nextcloud.com/
+        echo 'Nextcloud container: DNS and outbound HTTPS passed.'
+    fi
+fi
+echo 'Host firewall active and enabled; reload preserved existing Docker/Fail2ban tables.'
+echo 'Public Docker bridge ports require membership in docker_public_tcp_ports / docker_public_udp_ports.'
+nft list set inet "$profile" docker_public_tcp_ports
+nft list set inet "$profile" docker_public_udp_ports
+)
+mark_done "firewall_docker_forward"
 
 # ---------------------------------------------------------------------------
 # Step 5: Administrator tools
@@ -1224,6 +1375,25 @@ EOF
 
         aio_log "Configuring Virtualmin 'Reverse Proxy' Server Template"
 
+        # Preserve the cloned Apache directives except these two host aliases.
+        RP_APACHE_TEMPLATE_FILE="$(mktemp)"
+
+        if ! virtualmin get-template \
+            --name "Reverse Proxy" \
+            --inherited \
+            --setting web \
+            | tr '\t' '\n' \
+            | awk '
+                $1 == "ServerAlias" &&
+                ($2 == "www.${DOM}" || $2 == "mail.${DOM}") &&
+                NF == 2 { next }
+                { print }
+            ' > "$RP_APACHE_TEMPLATE_FILE"
+        then
+            rm -f "$RP_APACHE_TEMPLATE_FILE"
+            aio_die "Failed to read the Reverse Proxy Apache template directives."
+        fi
+
         virtualmin modify-template \
             --name "Reverse Proxy" \
             --setting mysql_mkdb --value 0 \
@@ -1231,12 +1401,18 @@ EOF
             --setting ushell --value "/dev/null" \
             --setting web_admin --value 0 \
             --setting web_cgimode --value "none" \
+            --setting web_php_suexec --value 4 \
+            --setting web --value-file "$RP_APACHE_TEMPLATE_FILE" \
             --setting web_webmail --value 0 \
             --setting web_sslredirect --value 1 \
             --setting ssl_auto_letsencrypt --value 0 \
             --setting mail_subject --value "" \
-            || aio_die \
-                "Failed to configure Virtualmin 'Reverse Proxy' template."
+            || {
+                rm -f "$RP_APACHE_TEMPLATE_FILE"
+                aio_die "Failed to configure Virtualmin 'Reverse Proxy' template."
+            }
+
+        rm -f "$RP_APACHE_TEMPLATE_FILE"
 
         log_success \
             "Virtualmin 'Reverse Proxy' Server Template created and configured."
@@ -1252,15 +1428,15 @@ EOF
 
         virtualmin create-plan \
             --name "Reverse Proxy" \
-            --quota 1048576 \
-            --admin-quota 1048576 \
+            --quota 5242880 \
+            --admin-quota 5242880 \
             --max-mailbox 1 \
             --max-alias 0 \
             --max-dbs 0 \
             --max-doms 0 \
             --max-aliasdoms 0 \
             --max-realdoms 0 \
-            --features "unix dir web ssl logrotate" \
+            --features "unix dir web ssl logrotate dns" \
             --capabilities "domain users aliases" \
             || aio_die \
                 "Failed to create Virtualmin 'Reverse Proxy' account plan."
@@ -1541,26 +1717,21 @@ EOF
 
 
         # -------------------------------------------------------------------
-        # HTTP protocols
+        # Nextcloud AIO Apache directives and HTTP protocols
+        #
+        # Configure the newly created host in one Virtualmin call. Repeated
+        # --add-directive arguments apply to both HTTP and HTTPS virtual hosts.
+        # Route Nextcloud discovery URLs around Virtualmin's local
+        # /.well-known exception for Let's Encrypt. The redirect targets are
+        # outside that exception and reach AIO through the existing / proxy.
+        # ACME challenge files retain their existing local handling.
         # -------------------------------------------------------------------
 
-        aio_log "Configuring HTTP protocols"
+        aio_log "Configuring Nextcloud Apache directives and discovery redirects"
 
         virtualmin modify-web \
             --domain "$AIO_DOMAIN" \
             --protocols "http/1.1 h2" \
-            || aio_die \
-                "Virtualmin protocol configuration failed."
-
-
-        # -------------------------------------------------------------------
-        # Nextcloud AIO Apache directives
-        # -------------------------------------------------------------------
-
-        aio_log "Adding Nextcloud AIO Apache directives"
-
-        virtualmin modify-web \
-            --domain "$AIO_DOMAIN" \
             --add-directive "ProxyPreserveHost On" \
             --add-directive "AllowEncodedSlashes NoDecode" \
             --add-directive "H2WindowSize 5242880" \
@@ -1568,7 +1739,12 @@ EOF
             --add-directive "LimitRequestBody 0" \
             --add-directive "Timeout 3610" \
             --add-directive "ProxyTimeout 3610" \
-            || aio_die "Failed to add Nextcloud AIO Apache directives"
+            --add-directive "RewriteEngine On" \
+            --add-directive 'RewriteRule ^/\.well-known/webfinger/?$ /index.php/.well-known/webfinger [R=301,L]' \
+            --add-directive 'RewriteRule ^/\.well-known/nodeinfo/?$ /index.php/.well-known/nodeinfo [R=301,L]' \
+            --add-directive 'RewriteRule ^/\.well-known/caldav/?$ /remote.php/dav/ [R=301,L]' \
+            --add-directive 'RewriteRule ^/\.well-known/carddav/?$ /remote.php/dav/ [R=301,L]' \
+            || aio_die "Failed to configure Nextcloud Apache directives and discovery redirects."
 
 
         # -------------------------------------------------------------------
@@ -1671,6 +1847,14 @@ fi
 
 log_success "Docker restarted and nftables networking finalized."
 
+# Reproduce the original failure condition: reload AFTER Docker is running.
+# No Docker restart follows this reload, so connectivity cannot mask lost NAT.
+log_step "Verifying Docker connectivity after a host firewall reload"
+systemctl reload nftables
+systemctl is-active --quiet nftables
+systemctl is-enabled --quiet nftables
+log_success "Host firewall active and enabled at boot."
+
 test_docker_networking
 
 # Check the locally bound administrator services. Allow for container startup.
@@ -1732,6 +1916,9 @@ echo "Administrator    : $sudo_user"
 echo "SSH authentication: SSH key only"
 echo "Sudo             : NOPASSWD"
 echo "Docker           : installed"
+echo "Host firewall    : active, enabled; Docker connectivity passed after reload"
+echo "Docker ingress   : only ports in docker_public_tcp_ports / docker_public_udp_ports"
+echo "                   Edit those sets in /etc/nftables.conf to allow or close public container ports."
 echo "Portainer        : installed"
 
 echo "NextCloud-AIO    : $([[ "$install_nc" =~ ^y$ ]] && echo "installed" || echo "not installed")"
@@ -1787,599 +1974,3 @@ else
     echo "Installation completed successfully; required local connectivity tests passed."
 fi
 echo "Nextcloud AIO, if selected, still needs to be completed in its admin interface."
-
-# =============================================================================
-# Optional final stage: ClamAV unofficial sources + Maldet on Debian 13
-# =============================================================================
-# The original initialization above is preserved verbatim. This stage runs ONLY
-# after the required setup has completed (INSTALL_COMPLETE=1). Its failures do
-# NOT change the outcome of the main initializer.
-#
-# This addon never manages Virtualmin, Fail2ban, nftables, Docker, Postfix,
-# Cloudflare or the existing Maldet quarantine / cleaning policies.
-# Installed addon remains callable separately for recovery:
-#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --install
-#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --status
-#   sudo bash /usr/local/sbin/virtualmin-clamav-maldet-addon.sh --verify
-#
-# Addon state: /var/lib/virtualmin-clamav-maldet-setup/
-# Addon log:   /var/log/virtualmin-clamav-maldet-setup.log
-# =============================================================================
-
-SEC_ADDON_SCRIPT='/usr/local/sbin/virtualmin-clamav-maldet-addon.sh'
-SEC_ADDON_STEP='clamav_maldet_addon'
-SEC_ADDON_STATE='/var/lib/virtualmin-clamav-maldet-setup'
-
-install_security_addon_script() {
-    local tmp=''
-    if ! install -d -m 0755 /usr/local/sbin; then
-        echo 'WARNING: Cannot prepare /usr/local/sbin for optional security addon.' >&2
-        return 1
-    fi
-    if ! tmp="$(mktemp /usr/local/sbin/.virtualmin-clamav-maldet.XXXXXXXX)"; then
-        echo 'WARNING: Cannot allocate temporary security addon script.' >&2
-        return 1
-    fi
-    # Bundle the complete, version-pinned, standalone v1.3 addon as plain text.
-    # It is written only AFTER the required initialization has succeeded.
-    if ! cat > "$tmp" <<'__VIRTUALMIN_CLAMAV_MALDET_ADDON_2026_10__'
-#!/usr/bin/env bash
-# ClamAV + Maldet addon for EXISTING Debian 13 / Virtualmin installations.
-# v1.3 (2026-10-10): durable resumable steps, diagnostics, active service startup.
-# Standalone for now. NOT integrated into initiate_debian13.sh.
-# Install: sudo bash SCRIPT [--install]
-# Verify:  sudo bash SCRIPT --verify       (read-only)
-# Status:  sudo bash SCRIPT --status       (read-only)
-# No full file scans. Does NOT configure Virtualmin, Webmin, Fail2ban, SSHGuard,
-# firewall, Docker, mail, quarantine or clean-up policy.
-# Fresh Maldet: upstream alert-only quarantine defaults are left untouched.
-set -Eeuo pipefail
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-umask 027
-
-readonly ADDON_VERSION='1.3.0'
-readonly X_VER='8.0.0'
-readonly LMD_VER='2.0.1'
-readonly X_BASE="https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/${X_VER}"
-readonly LMD_ARCHIVE="https://github.com/rfxn/linux-malware-detect/archive/refs/tags/v${LMD_VER}.tar.gz"
-readonly ROOT_STATE='/var/lib/virtualmin-clamav-maldet-setup'
-readonly DONE_DIR="$ROOT_STATE/done"
-readonly CACHE_DIR="$ROOT_STATE/downloads"
-readonly LOG='/var/log/virtualmin-clamav-maldet-setup.log'
-readonly X_CONF='/etc/clamav-unofficial-sigs'
-readonly X_BIN='/usr/local/sbin/clamav-unofficial-sigs.sh'
-readonly X_MARKER='# Managed by setup-virtualmin-clamav-maldet-debian13.sh'
-readonly X_CRON='/etc/cron.d/clamav-unofficial-sigs'
-readonly X_ROTATE='/etc/logrotate.d/clamav-unofficial-sigs'
-readonly MALDET_HOME='/usr/local/maldetect'
-readonly MALDET_CONF='/usr/local/maldetect/conf.maldet'
-readonly CLAM_DB='/var/lib/clamav'
-readonly MALDET_FRESH_INTENT="$ROOT_STATE/maldet-fresh-intent"
-readonly X_INSTALL_INTENT="$ROOT_STATE/updater-install-intent"
-readonly MODE="${1:---install}"
-CURRENT_STEP='startup'
-LAST_ERROR=''
-SUCCESS=0
-LOCK_FD=''
-
-msg() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
-info() { msg "INFO  $*"; }
-warn() { msg "WARN  $*" >&2; }
-fail() { LAST_ERROR="$*"; msg "ERROR $*" >&2; exit 1; }
-record_failure() {
-  local rc="$1" line="$2" cmd="$3" reason
-  reason="${LAST_ERROR:-Command failed at line $line: $cmd}"
-  if [[ -d "$ROOT_STATE" ]]; then
-    printf 'timestamp=%s\nversion=%s\nstep=%s\nexit_code=%s\nreason=%s\n' \
-      "$(date -Is)" "$ADDON_VERSION" "$CURRENT_STEP" "$rc" "$reason" > "$ROOT_STATE/last_failure"
-  fi
-  warn "ADDON FAILED at step: $CURRENT_STEP (exit $rc)"
-  warn "$reason"
-  warn "Progress retained in $ROOT_STATE; rerun the same script to resume."
-  warn "Detailed log: $LOG"
-}
-on_error() {
-  local rc="$1" line="$2" cmd="$3"
-  LAST_ERROR="${LAST_ERROR:-line $line, command: $cmd}"
-  exit "$rc"
-}
-on_exit() {
-  local rc="$1"
-  if [[ "$MODE" == --install && "$rc" -ne 0 ]]; then
-    record_failure "$rc" "${BASH_LINENO[0]:-?}" "${BASH_COMMAND:-?}"
-  fi
-}
-trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
-trap 'on_exit "$?"' EXIT
-
-usage() {
-  echo "Usage: sudo bash $0 [--install|--verify|--status]" >&2
-  exit 2
-}
-case "$MODE" in --install|--verify|--status) ;; *) usage ;; esac
-[[ $# -le 1 ]] || usage
-[[ $EUID -eq 0 ]] || fail 'Run with sudo/root'
-[[ -r /etc/os-release ]] || fail 'Missing /etc/os-release'
-# shellcheck disable=SC1091
-source /etc/os-release
-[[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 ]] || fail "Debian 13 required (found ${PRETTY_NAME:-unknown})"
-
-if [[ "$MODE" == --status ]]; then
-  echo "Addon version: $ADDON_VERSION"
-  echo "State directory: $ROOT_STATE"
-  if [[ -d "$DONE_DIR" ]]; then
-    printf 'Completed steps:\n'
-    find "$DONE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '  %f\n' | sort
-  else
-    echo 'No recorded steps yet.'
-  fi
-  if [[ -f "$ROOT_STATE/current_step" ]]; then
-    printf 'Last attempted step: '; cat "$ROOT_STATE/current_step"
-  fi
-  if [[ -f "$ROOT_STATE/last_failure" ]]; then
-    printf '\nLast failure:\n'; cat "$ROOT_STATE/last_failure"
-  fi
-  exit 0
-fi
-
-cfg_exact() { grep -Fqx -- "$2" "$1"; }
-monitor_mode_users() {
-  # Maldet service loads both environment files, default being last.
-  # If an existing admin disabled monitoring, never override that decision.
-  local mode=''
-  local f
-  for f in /etc/sysconfig/maldet /etc/default/maldet; do
-    if [[ -f "$f" ]]; then
-      mode=$(sed -n -E 's/^[[:space:]]*MONITOR_MODE="?([^"[:space:]]+)"?[[:space:]]*$/\1/p' "$f" | tail -n 1 || true)
-    fi
-  done
-  [[ "$mode" == users ]]
-}
-monitor_requested() {
-  monitor_mode_users || [[ -f "$MALDET_FRESH_INTENT" ]]
-}
-verify_monitor() {
-  if monitor_requested; then
-    systemctl is-enabled --quiet maldet.service || return 1
-    systemctl is-active --quiet maldet.service || return 1
-    # Restrict process check to this service, not another unrelated inotifywait.
-    systemctl status maldet.service --no-pager -l 2>/dev/null | grep -q 'inotifywait' || return 1
-  fi
-  return 0
-}
-validate_sources() {
-  local f="$X_CONF/user.conf" setting db
-  [[ -s "$X_BIN" && -s "$f" ]] || return 1
-  cfg_exact "$f" "$X_MARKER" || return 1
-  for setting in 'sanesecurity_enabled="yes"' 'interserver_enabled="yes"' \
-    'urlhaus_enabled="yes"' 'linuxmalwaredetect_enabled="no"' \
-    'remove_disabled_databases="no"' 'default_dbs_rating="LOW"' \
-    'allow_upgrades="no"' 'user_configuration_complete="yes"'; do
-    cfg_exact "$f" "$setting" || return 1
-  done
-  for db in junk.ndb interserver256.hdb urlhaus.ndb rfxn.hdb rfxn.ndb; do
-    [[ -s "$CLAM_DB/$db" ]] || return 1
-  done
-  return 0
-}
-verify_all() {
-  local errors=0
-  echo "== Read-only verification (no scans or updates) =="
-  for s in clamav-daemon clamav-freshclam cron; do
-    if systemctl is-active --quiet "$s"; then echo "OK: $s active"; else echo "FAIL: $s inactive"; errors=$((errors+1)); fi
-  done
-  if validate_sources; then echo 'OK: four-source databases and configuration'; else echo 'FAIL: sources/configuration'; errors=$((errors+1)); fi
-  if [[ -s "$MALDET_CONF" ]] && cfg_exact "$MALDET_CONF" 'scan_clamscan="1"' \
-    && cfg_exact "$MALDET_CONF" 'autoupdate_signatures="1"'; then
-    echo 'OK: Maldet ClamAV integration + signature updating'
-  else echo 'FAIL: Maldet integration'; errors=$((errors+1)); fi
-  if [[ -s "$X_CRON" && -s "$X_ROTATE" && -s /etc/cron.daily/maldet ]]; then
-    echo 'OK: updater cron and logrotate configured'
-  else echo 'FAIL: updater schedule/logrotate'; errors=$((errors+1)); fi
-  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
-    if [[ -s /etc/cron.d/maldet-sigup ]]; then echo 'OK: Maldet 6-hour signature job';
-    else echo 'FAIL: Maldet 6-hour signature job missing'; errors=$((errors+1)); fi
-  elif [[ -s /etc/cron.daily/maldet ]]; then
-    echo 'INFO: Maldet signature maintenance via daily cron'
-  else echo 'FAIL: Maldet signature maintenance'; errors=$((errors+1)); fi
-  if verify_monitor; then
-    if monitor_requested; then echo 'OK: Maldet monitoring service active with inotifywait';
-    else echo 'INFO: Maldet monitoring not requested by existing configuration'; fi
-  else echo 'FAIL: Maldet monitor requested but not running'; errors=$((errors+1)); fi
-  if (( errors )); then echo "FAIL: $errors verification check(s)"; return 1; fi
-  echo 'PASS: configured components present and services healthy (no full scan performed)'
-}
-if [[ "$MODE" == --verify ]]; then
-  verify_all
-  exit 0
-fi
-
-# All write operations below are in --install only. Persistent state and full log.
-install -d -m 0750 "$ROOT_STATE" "$DONE_DIR" "$CACHE_DIR"
-touch "$LOG"; chmod 0600 "$LOG"
-exec > >(tee -a "$LOG") 2>&1
-# Avoid simultaneous manual reruns; updater's own cron locking is independent.
-exec {LOCK_FD}>"$ROOT_STATE/installer.lock"
-flock -n "$LOCK_FD" || fail 'Another addon installation is running'
-info "Starting addon v$ADDON_VERSION; previous completed steps will be validated and reused"
-
-# When an earlier stage must be repaired, downstream completion markers cannot
-# be trusted until those stages run again (especially daemon reload after DBs).
-readonly -a STEP_ORDER=(preflight dependencies downloads maldet_install maldet_config maldet_signatures updater_config updater_run daemon schedule monitor complete)
-invalidate_downstream() {
-  local from="$1" step seen=0
-  for step in "${STEP_ORDER[@]}"; do
-    if [[ "$step" == "$from" ]]; then seen=1; continue; fi
-    if (( seen )); then rm -f -- "$DONE_DIR/$step"; fi
-  done
-}
-
-run_step() {
-  local id="$1" title="$2"
-  CURRENT_STEP="$id"
-  printf '%s\n' "$id" > "$ROOT_STATE/current_step"
-  if [[ "$id" != preflight && -f "$DONE_DIR/$id" ]] && "check_$id"; then
-    info "SKIP $id: already completed and still valid"
-    return 0
-  fi
-  info "START $id: $title"
-  if [[ "$id" != preflight ]]; then
-    invalidate_downstream "$id"
-  fi
-  "do_$id"
-  "check_$id" || fail "Validation failed after step $id; see logs above"
-  printf '%s\t%s\t%s\n' "$(date -Is)" "$ADDON_VERSION" "$title" > "$DONE_DIR/$id.tmp.$$"
-  mv -f "$DONE_DIR/$id.tmp.$$" "$DONE_DIR/$id"
-  info "DONE  $id"
-}
-
-# The validators favor stable postconditions, not cached success alone.
-check_preflight() {
-  command -v clamscan >/dev/null && command -v systemctl >/dev/null && \
-    id clamav >/dev/null 2>&1 && [[ -d "$CLAM_DB" ]] && \
-    systemctl is-active --quiet clamav-daemon && \
-    systemctl is-active --quiet clamav-freshclam
-}
-do_preflight() {
-  check_preflight || fail 'Require existing operational ClamAV daemon and FreshClam; no Virtualmin/ClamAV reinstall is attempted'
-  if [[ ! -d /etc/webmin/virtual-server ]]; then
-    warn 'Virtualmin module not found at standard path; addon continues without modifying Virtualmin'
-  fi
-  if dpkg-query -W -f='${Status}' clamav-unofficial-sigs 2>/dev/null | grep -qx 'install ok installed'; then
-    fail 'Debian-packaged clamav-unofficial-sigs already installed; cannot safely take over its databases'
-  fi
-  local found
-  found=$(command -v clamav-unofficial-sigs.sh || true)
-  [[ -z "$found" || "$found" == "$X_BIN" ]] || fail "Different unofficial updater located at $found"
-  if [[ -e "$X_BIN" || -d "$X_CONF" || -e "$X_CRON" ]]; then
-    if [[ -f "$X_CONF/user.conf" ]]; then
-      cfg_exact "$X_CONF/user.conf" "$X_MARKER" || \
-        fail 'Unmanaged unofficial updater exists; refusing to overwrite configuration'
-    elif [[ -f "$X_INSTALL_INTENT" ]]; then
-      warn 'Recognized incomplete updater installation previously started by this addon; resuming'
-    else
-      fail 'Unmanaged or incomplete unofficial updater exists; refusing to take ownership'
-    fi
-  else
-    # Don't claim existing third-party DBs managed by another updater.
-    while IFS= read -r -d '' item; do
-      case "${item##*/}" in
-        rfxn.hdb|rfxn.ndb|rfxn.hsb|rfxn.yara) [[ -d "$MALDET_HOME" ]] && continue ;;
-      esac
-      fail "Unmanaged third-party database detected: $item"
-    done < <(find "$CLAM_DB" -maxdepth 1 -type f \( -name '*.hdb' -o -name '*.hsb' -o -name '*.ndb' \
-      -o -name '*.ldb' -o -name '*.fp' -o -name '*.ign2' -o -name '*.yara' \) -print0)
-  fi
-  if [[ -r /etc/clamav/clamd.conf ]]; then
-    local dbpath
-    dbpath=$(awk '$1=="DatabaseDirectory" {last=$2} END {print last}' /etc/clamav/clamd.conf)
-    [[ -z "$dbpath" || "$dbpath" == "$CLAM_DB" ]] || fail "Nonstandard database directory $dbpath requires manual review"
-  fi
-}
-check_dependencies() {
-  local c
-  for c in curl rsync gpg dig logrotate clamdscan inotifywait tar flock runuser file ps; do
-    command -v "$c" >/dev/null || return 1
-  done
-  systemctl is-active --quiet cron
-}
-do_dependencies() {
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl wget rsync gnupg bind9-dnsutils cron logrotate \
-    clamdscan inotify-tools tar procps psmisc file lsof unzip util-linux
-  systemctl enable --now cron
-}
-fetch_cached() {
-  local url="$1" dest="$2"
-  if [[ -s "$dest" ]]; then return 0; fi
-  local tmp="$dest.partial.$$"
-  curl --fail --location --silent --show-error --retry 3 --connect-timeout 20 --max-time 300 "$url" -o "$tmp"
-  [[ -s "$tmp" ]] || fail "Empty download from $url"
-  mv -f "$tmp" "$dest"
-}
-check_downloads() {
-  [[ -s "$CACHE_DIR/x.sh" && -s "$CACHE_DIR/master.conf" && -s "$CACHE_DIR/os.conf" \
-      && -s "$CACHE_DIR/user.conf" && -s "$CACHE_DIR/lmd.tar.gz" ]] && \
-    bash -n "$CACHE_DIR/x.sh" && \
-    grep -Fqx 'config_version="100"' "$CACHE_DIR/master.conf" && \
-    grep -q 'Debian 13 trixie' "$CACHE_DIR/os.conf" && \
-    tar -tzf "$CACHE_DIR/lmd.tar.gz" >/dev/null
-}
-do_downloads() {
-  fetch_cached "$X_BASE/clamav-unofficial-sigs.sh" "$CACHE_DIR/x.sh"
-  fetch_cached "$X_BASE/config/master.conf" "$CACHE_DIR/master.conf"
-  fetch_cached "$X_BASE/config/user.conf" "$CACHE_DIR/user.conf"
-  fetch_cached "$X_BASE/config/os/os.debian.conf" "$CACHE_DIR/os.conf"
-  fetch_cached "$LMD_ARCHIVE" "$CACHE_DIR/lmd.tar.gz"
-  check_downloads || fail 'Unexpected upstream downloads, versions, or invalid archive'
-}
-check_maldet_install() { [[ -s "$MALDET_CONF" && -x "$MALDET_HOME/maldet" ]] && command -v maldet >/dev/null; }
-do_maldet_install() {
-  if [[ -d "$MALDET_HOME" ]]; then
-    if check_maldet_install; then
-      info 'Existing Maldet detected; preserving its version/quarantine/clean policy'
-      return 0
-    fi
-    if [[ ! -f "$MALDET_FRESH_INTENT" ]]; then
-      fail 'Partial pre-existing Maldet installation; manual inspection required'
-    fi
-    warn 'Retrying interrupted Maldet installation originally started by this addon'
-  else
-    command -v maldet >/dev/null 2>&1 && fail 'Maldet exists outside expected /usr/local/maldetect path'
-    # Record intent BEFORE starting installer, surviving any interruption.
-    printf '%s\n' "$(date -Is)" > "$MALDET_FRESH_INTENT"
-  fi
-  local src="$ROOT_STATE/maldet-source"
-  install -d -m 0750 "$src"
-  tar -xzf "$CACHE_DIR/lmd.tar.gz" -C "$src" --strip-components=1
-  [[ -s "$src/install.sh" ]] || fail 'Missing Maldet installer in archive'
-  bash -n "$src/install.sh"
-  grep -Fq 'lmd_version="2.0.1"' "$src/install.sh" || fail 'Unexpected Maldet version'
-  (cd "$src" && bash ./install.sh)
-}
-check_maldet_config() {
-  check_maldet_install && cfg_exact "$MALDET_CONF" 'scan_clamscan="1"' && \
-    cfg_exact "$MALDET_CONF" 'autoupdate_signatures="1"' || return 1
-  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
-    monitor_mode_users || return 1
-  fi
-  if [[ -n "${MALDET_ALERT_EMAIL:-}" ]]; then
-    cfg_exact "$MALDET_CONF" 'email_alert="1"' &&
-      cfg_exact "$MALDET_CONF" "email_addr=\"$MALDET_ALERT_EMAIL\"" || return 1
-  fi
-  return 0
-}
-set_maldet_setting() {
-  local key="$1" val="$2" existing
-  existing=$(grep -E "^${key}=" "$MALDET_CONF" | tail -n 1 || true)
-  [[ -n "$existing" ]] || fail "Maldet setting $key missing; unsupported configuration"
-  [[ "$existing" == "${key}=\"${val}\"" ]] && return 0
-  cp -a "$MALDET_CONF" "$MALDET_CONF.bak-$(date +%Y%m%d-%H%M%S)"
-  sed -i -E "s|^${key}=.*|${key}=\"${val}\"|" "$MALDET_CONF"
-}
-do_maldet_config() {
-  set_maldet_setting scan_clamscan 1
-  set_maldet_setting autoupdate_signatures 1
-  if [[ -n "${MALDET_ALERT_EMAIL:-}" ]]; then
-    [[ "$MALDET_ALERT_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || fail 'MALDET_ALERT_EMAIL invalid'
-    set_maldet_setting email_alert 1
-    set_maldet_setting email_addr "$MALDET_ALERT_EMAIL"
-  fi
-  # Fresh installs only: monitor starts in 'users' mode via systemd env.
-  # Existing installations retain their explicitly chosen mode.
-  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
-    [[ -f /etc/default/maldet ]] || fail 'Fresh Maldet missing /etc/default/maldet'
-    if grep -q '^MONITOR_MODE=' /etc/default/maldet; then
-      sed -i -E 's|^MONITOR_MODE=.*|MONITOR_MODE="users"|' /etc/default/maldet
-    else
-      printf '%s\n' 'MONITOR_MODE="users"' >> /etc/default/maldet
-    fi
-  fi
-}
-check_maldet_signatures() { [[ -s "$CLAM_DB/rfxn.hdb" && -s "$CLAM_DB/rfxn.ndb" ]]; }
-do_maldet_signatures() { maldet -u; }
-check_updater_config() {
-  [[ -x "$X_BIN" && -s "$X_CONF/master.conf" && -s "$X_CONF/os.conf" \
-     && -s "$X_CONF/user.conf" ]] && \
-    cfg_exact "$X_CONF/user.conf" "$X_MARKER" && \
-    cfg_exact "$X_CONF/user.conf" 'linuxmalwaredetect_enabled="no"' && \
-    cfg_exact "$X_CONF/user.conf" 'remove_disabled_databases="no"' && \
-    cfg_exact "$X_CONF/user.conf" 'default_dbs_rating="LOW"'
-}
-do_updater_config() {
-  local conf_stage="$ROOT_STATE/user.conf.new" f
-  cp "$CACHE_DIR/user.conf" "$conf_stage"
-  cat >> "$conf_stage" <<'CONFIG'
-
-# Managed by setup-virtualmin-clamav-maldet-debian13.sh
-sanesecurity_enabled="yes"
-interserver_enabled="yes"
-urlhaus_enabled="yes"
-# Maldet owns rfxn.* signature DBs; avoid competing updates/deletion.
-linuxmalwaredetect_enabled="no"
-remove_disabled_databases="no"
-malwareexpert_enabled="no"
-malwarepatrol_enabled="no"
-securiteinfo_enabled="no"
-ditekshen_enabled="no"
-twinclams_enabled="no"
-yararulesproject_enabled="no"
-additional_enabled="no"
-default_dbs_rating="LOW"
-allow_upgrades="no"
-user_configuration_complete="yes"
-CONFIG
-  # master.conf is NOT standalone Bash syntax (contains name|RATING arrays).
-  # Only run bash -n on the executable, never on master.conf.
-  bash -n "$CACHE_DIR/x.sh" || fail 'Downloaded executable failed syntax test'
-  install -d -m 0755 "$X_CONF"
-  if [[ -f "$X_CONF/user.conf" ]] && ! cfg_exact "$X_CONF/user.conf" "$X_MARKER"; then
-    fail 'Unmanaged unofficial-sigs user.conf detected; will not overwrite it'
-  fi
-  # Record ownership intent BEFORE the first managed file is written.
-  # This prevents a power loss after master.conf from creating an unresumable
-  # "unmanaged partial installation" on the next run.
-  printf '%s\n' "$(date -Is)" > "$X_INSTALL_INTENT"
-  if [[ -f "$X_CONF/user.conf" ]] && ! cmp -s "$X_CONF/user.conf" "$conf_stage"; then
-    cp -a "$X_CONF/user.conf" "$X_CONF/user.conf.bak-$(date +%Y%m%d-%H%M%S)"
-  fi
-  install -o root -g root -m 0644 "$CACHE_DIR/master.conf" "$X_CONF/master.conf"
-  install -o root -g root -m 0644 "$CACHE_DIR/os.conf" "$X_CONF/os.conf"
-  install -o root -g clamav -m 0640 "$conf_stage" "$X_CONF/user.conf"
-  install -o root -g root -m 0755 "$CACHE_DIR/x.sh" "$X_BIN"
-  "$X_BIN" --information
-}
-check_updater_run() { [[ -s "$CLAM_DB/junk.ndb" && -s "$CLAM_DB/interserver256.hdb" && -s "$CLAM_DB/urlhaus.ndb" ]]; }
-do_updater_run() {
-  # No --force: provider rate limits are respected.
-  if ps -eo args= | grep -E '[c]lamav-unofficial-sigs[.]sh( |$)' >/dev/null; then
-    fail 'Updater already running from cron; rerun after it finishes'
-  fi
-  "$X_BIN"
-}
-check_daemon() { systemctl is-active --quiet clamav-daemon && clamdscan --version >/dev/null 2>&1; }
-do_daemon() {
-  # Request a single reload, then ensure daemon responds. No full scan.
-  clamdscan --reload
-  local good=0 i
-  for ((i=0; i<36; i++)); do
-    if clamdscan --fdpass --no-summary /etc/hosts >/dev/null 2>&1; then good=1; break; fi
-    sleep 5
-  done
-  ((good)) || fail 'ClamAV daemon not responding after database reload'
-}
-check_schedule() {
-  [[ -s "$X_CRON" && -s "$X_ROTATE" && -s /etc/cron.daily/maldet ]] && \
-    systemctl is-active --quiet cron && \
-    grep -Eq '^[0-9]{1,2} \* \* \* \* +clamav ' "$X_CRON" && \
-    command -v logrotate >/dev/null || return 1
-  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
-    [[ -s /etc/cron.d/maldet-sigup ]] || return 1
-  fi
-  return 0
-}
-do_schedule() {
-  "$X_BIN" --install-logrotate
-  logrotate -d "$X_ROTATE" >/dev/null 2>&1 || fail 'Unofficial updater logrotate config invalid'
-  for p in "$CLAM_DB" /var/lib/clamav-unofficial-sigs /var/log/clamav-unofficial-sigs/clamav-unofficial-sigs.log; do
-    runuser -u clamav -- test -w "$p" || fail "clamav user cannot write $p"
-  done
-  "$X_BIN" --install-cron
-  [[ -s /etc/cron.daily/maldet ]] || fail 'Maldet daily cron missing'
-  if cfg_exact "$MALDET_CONF" 'sigup_interval="6"'; then
-    [[ -s /etc/cron.d/maldet-sigup ]] || fail 'Configured Maldet six-hour signature cron missing'
-  fi
-  if [[ -f "$MALDET_FRESH_INTENT" ]]; then
-    [[ -s /etc/logrotate.d/maldet ]] || fail 'Expected Maldet logrotate config missing'
-  fi
-  systemctl enable --now cron
-}
-check_monitor() { verify_monitor; }
-do_monitor() {
-  if monitor_requested; then
-    if [[ -f "$MALDET_FRESH_INTENT" ]]; then
-      [[ -f /etc/default/maldet ]] || fail 'New Maldet missing /etc/default/maldet'
-      grep -Fqx 'MONITOR_MODE="users"' /etc/default/maldet || fail 'Fresh Maldet monitor mode not users'
-    fi
-    systemctl daemon-reload
-    systemctl enable maldet.service
-    # Important v1.3 fix: 'enable' alone doesn't start an already-enabled
-    # service. Explicitly start and verify this service's inotify process.
-    if ! systemctl is-active --quiet maldet.service; then
-      systemctl start maldet.service || fail 'Maldet service failed: journalctl -u maldet -n 60'
-    fi
-    local ready=0 i
-    for ((i=0; i<12; i++)); do
-      if verify_monitor; then ready=1; break; fi
-      sleep 2
-    done
-    ((ready)) || fail 'Maldet service not healthy/inotifywait missing. Check journalctl -u maldet -n 60'
-  else
-    info 'Existing Maldet monitoring intentionally unconfigured; preserving its existing choice'
-  fi
-}
-check_complete() { validate_sources && check_maldet_config && check_schedule && check_monitor && check_daemon; }
-do_complete() {
-  info 'Final checks: configuration, database presence, services and cron only; no full scan'
-  verify_all
-}
-
-run_step preflight 'Check existing ClamAV, Virtualmin, and signature ownership'
-run_step dependencies 'Install only missing utilities and enable cron'
-run_step downloads 'Download pinned upstream files to persistent cache'
-run_step maldet_install 'Install Maldet if absent, recording fresh-install intent'
-run_step maldet_config 'Enable Maldet ClamAV engine; preserve quarantine policy'
-run_step maldet_signatures 'Update Maldet native rfxn.* signatures'
-run_step updater_config 'Configure three extra feeds and separate signature ownership'
-run_step updater_run 'Download/validate third-party ClamAV signatures'
-run_step daemon 'Reload and probe ClamAV daemon'
-run_step schedule 'Configure hourly update and log rotation'
-run_step monitor 'Start/verify Maldet systemd inotify monitoring if requested'
-run_step complete 'Validate installed system end-to-end without a full scan'
-CURRENT_STEP='complete'
-rm -f "$ROOT_STATE/last_failure"
-printf '%s\n' "$(date -Is)" > "$ROOT_STATE/completed_at"
-SUCCESS=1
-info "SUCCESS: ClamAV + Maldet addon operational; no full scan performed"
-info "Inspect state: sudo bash $0 --status"
-info "Verify read-only: sudo bash $0 --verify"
-__VIRTUALMIN_CLAMAV_MALDET_ADDON_2026_10__
-    then
-        echo 'WARNING: Could not write embedded security addon.' >&2
-        rm -f -- "$tmp"
-        return 1
-    fi
-    if ! bash -n "$tmp"; then
-        echo 'WARNING: Embedded security addon failed Bash syntax validation.' >&2
-        rm -f -- "$tmp"
-        return 1
-    fi
-    if ! chmod 0755 "$tmp" || ! mv -f -- "$tmp" "$SEC_ADDON_SCRIPT"; then
-        echo 'WARNING: Could not install security addon executable.' >&2
-        rm -f -- "$tmp"
-        return 1
-    fi
-    return 0
-}
-
-# This optional stage must never trip the parent's ERR or EXIT failure traps.
-# Explicit if/else branches protect every step under set -Eeuo pipefail.
-if [[ "${INSTALL_COMPLETE:-0}" != '1' ]]; then
-    echo 'WARNING: Required server installation is incomplete; security addon skipped.' >&2
-elif [[ "${OS_ID:-}" != 'debian' || "${OS_VERSION_ID:-}" != '13' ]]; then
-    echo "NOTICE: Optional ClamAV/Maldet addon is Debian 13-only; skipping for ${PRETTY_NAME:-this OS}."
-else
-    echo
-    echo '============================================================'
-    echo ' Optional final stage: ClamAV sources + Maldet'
-    echo '============================================================'
-    if ! install_security_addon_script; then
-        echo 'WARNING: Security addon extraction failed; main server installation remains successful.' >&2
-        echo "INFO: Main setup log: $LOG_FILE"
-    elif step_done "$SEC_ADDON_STEP" && bash "$SEC_ADDON_SCRIPT" --verify; then
-        echo 'SUCCESS: Previously installed security addon passed verification; nothing to redo.'
-    else
-        if bash "$SEC_ADDON_SCRIPT" --install; then
-            if bash "$SEC_ADDON_SCRIPT" --verify; then
-                if mark_done "$SEC_ADDON_STEP"; then
-                    echo 'SUCCESS: ClamAV/Maldet optional stage installed, verified, and recorded.'
-                else
-                    echo 'WARNING: Addon works, but the parent setup state could not record completion.' >&2
-                fi
-            else
-                echo 'WARNING: Security addon ran, but final verification failed.' >&2
-                echo 'WARNING: Main Virtualmin/Docker/Nextcloud installation remains successful.' >&2
-            fi
-        else
-            echo 'WARNING: Optional ClamAV/Maldet addon failed.' >&2
-            echo 'WARNING: All required earlier setup steps remain successful.' >&2
-        fi
-    fi
-    echo "Addon progress: $SEC_ADDON_STATE"
-    echo 'Addon log: /var/log/virtualmin-clamav-maldet-setup.log'
-    echo "Resume only this addon: sudo bash $SEC_ADDON_SCRIPT --install"
-    echo "Inspect progress:       sudo bash $SEC_ADDON_SCRIPT --status"
-    echo "Verify installed addon: sudo bash $SEC_ADDON_SCRIPT --verify"
-fi
-# INSTALL_COMPLETE remains 1. Main setup status is not dependent on addon.
